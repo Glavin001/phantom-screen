@@ -229,10 +229,17 @@ fn build_keycode_map(
     // Based on standard US keyboard layout; keycodes are hardware-level
     let mut map = HashMap::new();
 
-    // Letters
-    for (i, c) in ('a'..='z').enumerate() {
-        let code = format!("Key{}", c.to_uppercase().next().unwrap());
-        map.insert(code, 38 + i as u8); // 'a' starts at keycode 38 on standard X11
+    // Letters — X11 keycodes follow physical QWERTY layout, not alphabetical order
+    let letter_keycodes: &[(&str, u8)] = &[
+        ("KeyQ", 24), ("KeyW", 25), ("KeyE", 26), ("KeyR", 27), ("KeyT", 28),
+        ("KeyY", 29), ("KeyU", 30), ("KeyI", 31), ("KeyO", 32), ("KeyP", 33),
+        ("KeyA", 38), ("KeyS", 39), ("KeyD", 40), ("KeyF", 41), ("KeyG", 42),
+        ("KeyH", 43), ("KeyJ", 44), ("KeyK", 45), ("KeyL", 46),
+        ("KeyZ", 52), ("KeyX", 53), ("KeyC", 54), ("KeyV", 55), ("KeyB", 56),
+        ("KeyN", 57), ("KeyM", 58),
+    ];
+    for &(code, keycode) in letter_keycodes {
+        map.insert(code.into(), keycode);
     }
 
     // Digits
