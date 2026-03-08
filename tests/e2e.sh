@@ -33,8 +33,8 @@ NC='\033[0m'
 pass=0
 fail=0
 
-log_pass() { echo -e "  ${GREEN}PASS${NC} $1"; ((pass++)); }
-log_fail() { echo -e "  ${RED}FAIL${NC} $1"; ((fail++)); }
+log_pass() { echo -e "  ${GREEN}PASS${NC} $1"; pass=$((pass + 1)); }
+log_fail() { echo -e "  ${RED}FAIL${NC} $1"; fail=$((fail + 1)); }
 log_info() { echo -e "  ${YELLOW}INFO${NC} $1"; }
 
 cleanup() {
@@ -74,7 +74,7 @@ while [ $WAITED -lt $TIMEOUT ]; do
     break
   fi
   sleep 1
-  ((WAITED++))
+  WAITED=$((WAITED + 1))
 done
 
 if [ $WAITED -ge $TIMEOUT ]; then
