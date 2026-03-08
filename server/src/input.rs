@@ -16,9 +16,8 @@ impl InputHandler {
         // Set DISPLAY env var for x11rb
         // SAFETY: called before spawning threads, only modifies DISPLAY
         unsafe { std::env::set_var("DISPLAY", disp) };
-        let (conn, screen_num) =
-            x11rb::rust_connection::RustConnection::connect(Some(disp))
-                .context("Failed to connect to X11 display")?;
+        let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(disp))
+            .context("Failed to connect to X11 display")?;
 
         // Verify XTest extension is available
         conn.xtest_get_version(2, 1)
@@ -171,7 +170,9 @@ pub fn parse_input_event(data: &[u8]) -> Option<InputEvent> {
             if data.len() < 2 + code_len + 1 {
                 return None;
             }
-            let code = std::str::from_utf8(&data[2..2 + code_len]).ok()?.to_string();
+            let code = std::str::from_utf8(&data[2..2 + code_len])
+                .ok()?
+                .to_string();
             let pressed = data[2 + code_len] != 0;
             Some(InputEvent::KeyEvent { code, pressed })
         }
@@ -198,7 +199,10 @@ fn parse_control_event(data: &[u8]) -> Option<InputEvent> {
         0x03 if data.len() >= 6 => {
             let w = u16::from_be_bytes([data[2], data[3]]);
             let h = u16::from_be_bytes([data[4], data[5]]);
-            Some(InputEvent::SetResolution { width: w, height: h })
+            Some(InputEvent::SetResolution {
+                width: w,
+                height: h,
+            })
         }
         _ => None,
     }
@@ -302,6 +306,45 @@ fn build_keycode_map(
     map.insert("Pause".into(), 127);
 
     Ok(map)
+}
+
+/// Estimate the byte length of a binary-encoded input event.
+/// Returns 0 if the event type is unknown or the buffer is too short to determine length.
+pub fn estimate_event_length(data: &[u8]) -> usize {
+    if data.is_empty() {
+        return 0;
+    }
+    match data[0] {
+        0x01 => 5, // Mouse Move
+        0x02 => 3, // Mouse Button
+        0x03 => 5, // Mouse Scroll
+        0x10 => {
+            if data.len() < 2 {
+                return 0;
+            }
+            let code_len = data[1] as usize;
+            2 + code_len + 1
+        }
+        0x20 => {
+            if data.len() < 5 {
+                return 0;
+            }
+            let length = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+            5 + length
+        }
+        0x30 => {
+            if data.len() < 2 {
+                return 0;
+            }
+            match data[1] {
+                0x01 => 2,
+                0x02 => 6,
+                0x03 => 6,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
 }
 
 /// Fallback keycode resolution for codes not in the static map

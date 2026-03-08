@@ -2,12 +2,12 @@ use anyhow::{Context, Result};
 use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 
-use crate::config::{detect_encoder, Config, EncoderType};
+use crate::config::{Config, EncoderType, detect_encoder};
 
 /// Encoded H.264 frame data
 #[derive(Clone, Debug)]
@@ -86,16 +86,15 @@ pub fn start_pipeline(
     appsink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |appsink| {
-                let sample = appsink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
+                let sample = appsink
+                    .pull_sample()
+                    .map_err(|_| gstreamer::FlowError::Eos)?;
                 let buffer = sample.buffer().ok_or(gstreamer::FlowError::Error)?;
                 let map = buffer
                     .map_readable()
                     .map_err(|_| gstreamer::FlowError::Error)?;
 
-                let pts = buffer
-                    .pts()
-                    .map(|p| p.nseconds())
-                    .unwrap_or(0);
+                let pts = buffer.pts().map(|p| p.nseconds()).unwrap_or(0);
 
                 let is_keyframe = !buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT);
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use jsonwebtoken::{decode, DecodingKey, TokenData, Validation};
+use jsonwebtoken::{DecodingKey, TokenData, Validation, decode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,10 +32,10 @@ pub fn extract_token_from_path(path: &str) -> Option<&str> {
     // Parse query string from path
     let query = path.split('?').nth(1)?;
     for param in query.split('&') {
-        if let Some(value) = param.strip_prefix("token=") {
-            if !value.is_empty() {
-                return Some(value);
-            }
+        if let Some(value) = param.strip_prefix("token=")
+            && !value.is_empty()
+        {
+            return Some(value);
         }
     }
     None
@@ -44,7 +44,7 @@ pub fn extract_token_from_path(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_secs() -> usize {
@@ -113,10 +113,7 @@ mod tests {
 
     #[test]
     fn test_extract_token_from_path() {
-        assert_eq!(
-            extract_token_from_path("/?token=abc123"),
-            Some("abc123")
-        );
+        assert_eq!(extract_token_from_path("/?token=abc123"), Some("abc123"));
         assert_eq!(
             extract_token_from_path("/session?token=xyz&foo=bar"),
             Some("xyz")

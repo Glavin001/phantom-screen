@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main, claude/**]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Rust: lint, check, and unit/integration tests ──────────────────
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-xtest0-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('server/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Check formatting
+        working-directory: server
+        run: cargo fmt -- --check
+
+      - name: Clippy lint
+        working-directory: server
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        working-directory: server
+        run: cargo test --verbose
+
+  # ── TypeScript: lint, type-check, and unit/integration tests ───────
+  client:
+    name: Client tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Type check
+        working-directory: client
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        working-directory: client
+        run: npm test
+
+      - name: Build
+        working-directory: client
+        run: npm run build
+
+  # ── Docker: build image and run E2E tests ──────────────────────────
+  e2e:
+    name: E2E (Docker)
+    runs-on: ubuntu-latest
+    needs: [rust, client]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        run: ./tests/e2e.sh
+
+  # ── Docker image build (no E2E, just verify it builds) ─────────────
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t phantom-screen -f server/Dockerfile .

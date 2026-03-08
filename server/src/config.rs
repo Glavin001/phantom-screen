@@ -2,7 +2,10 @@ use clap::Parser;
 use std::net::SocketAddr;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "phantom-screen-server", about = "Remote desktop streaming server")]
+#[command(
+    name = "phantom-screen-server",
+    about = "Remote desktop streaming server"
+)]
 pub struct Config {
     /// X11 display to capture (e.g., ":99")
     #[arg(long, default_value = ":99")]
@@ -71,10 +74,7 @@ impl Config {
     }
 
     pub fn display_num(&self) -> u32 {
-        self.display
-            .trim_start_matches(':')
-            .parse()
-            .unwrap_or(99)
+        self.display.trim_start_matches(':').parse().unwrap_or(99)
     }
 }
 
@@ -85,7 +85,10 @@ pub fn detect_encoder() -> EncoderType {
         tracing::info!("Detected NVIDIA GPU encoder (nvh264enc)");
         return EncoderType::Nvenc;
     }
-    if gstreamer::ElementFactory::make("vaapih264enc").build().is_ok() {
+    if gstreamer::ElementFactory::make("vaapih264enc")
+        .build()
+        .is_ok()
+    {
         tracing::info!("Detected VA-API encoder (vaapih264enc)");
         return EncoderType::Vaapi;
     }
@@ -99,4 +102,93 @@ pub enum EncoderType {
     X264,
     Nvenc,
     Vaapi,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolution_parsing() {
+        let config = Config {
+            display: ":99".into(),
+            resolution: "1920x1080".into(),
+            listen: "0.0.0.0:4443".parse().unwrap(),
+            fps: 60,
+            bitrate: 6000,
+            keyframe_interval: 60,
+            cert: None,
+            key: None,
+            client_dir: "../client/dist".into(),
+            no_xvfb: false,
+            wm: "openbox".into(),
+            jwt_secret: None,
+        };
+
+        assert_eq!(config.resolution_width(), 1920);
+        assert_eq!(config.resolution_height(), 1080);
+    }
+
+    #[test]
+    fn test_resolution_parsing_custom() {
+        let config = Config {
+            display: ":1".into(),
+            resolution: "2560x1440".into(),
+            listen: "127.0.0.1:9000".parse().unwrap(),
+            fps: 30,
+            bitrate: 4000,
+            keyframe_interval: 30,
+            cert: Some("/path/to/cert.pem".into()),
+            key: Some("/path/to/key.pem".into()),
+            client_dir: "/var/www".into(),
+            no_xvfb: true,
+            wm: "fluxbox".into(),
+            jwt_secret: Some("secret".into()),
+        };
+
+        assert_eq!(config.resolution_width(), 2560);
+        assert_eq!(config.resolution_height(), 1440);
+        assert_eq!(config.display_num(), 1);
+    }
+
+    #[test]
+    fn test_resolution_parsing_invalid_fallback() {
+        let config = Config {
+            display: ":abc".into(),
+            resolution: "invalid".into(),
+            listen: "0.0.0.0:4443".parse().unwrap(),
+            fps: 60,
+            bitrate: 6000,
+            keyframe_interval: 60,
+            cert: None,
+            key: None,
+            client_dir: "../client/dist".into(),
+            no_xvfb: false,
+            wm: "openbox".into(),
+            jwt_secret: None,
+        };
+
+        assert_eq!(config.resolution_width(), 1920); // fallback
+        assert_eq!(config.resolution_height(), 1080); // fallback
+        assert_eq!(config.display_num(), 99); // fallback
+    }
+
+    #[test]
+    fn test_display_num() {
+        let config = Config {
+            display: ":42".into(),
+            resolution: "1920x1080".into(),
+            listen: "0.0.0.0:4443".parse().unwrap(),
+            fps: 60,
+            bitrate: 6000,
+            keyframe_interval: 60,
+            cert: None,
+            key: None,
+            client_dir: "../client/dist".into(),
+            no_xvfb: false,
+            wm: "openbox".into(),
+            jwt_secret: None,
+        };
+        assert_eq!(config.display_num(), 42);
+    }
 }

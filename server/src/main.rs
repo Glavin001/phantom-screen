@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod auth;
 mod config;
 mod control;
@@ -16,7 +18,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use config::Config;
-use input::{parse_input_event, InputEvent, InputHandler};
+use input::{InputEvent, InputHandler, estimate_event_length, parse_input_event};
 use pipeline::EncodedFrame;
 
 #[tokio::main]
@@ -55,9 +57,8 @@ async fn main() -> Result<()> {
     info!("GStreamer pipeline running");
 
     // Create input handler
-    let input_handler = Arc::new(
-        InputHandler::new(&config.display).context("Failed to create input handler")?,
-    );
+    let input_handler =
+        Arc::new(InputHandler::new(&config.display).context("Failed to create input handler")?);
 
     // Build WebTransport server config
     let identity = if let (Some(cert_path), Some(key_path)) = (&config.cert, &config.key) {
@@ -227,10 +228,7 @@ async fn handle_session(
 /// Frame format:
 /// [flags: u8] [pts: u64 BE] [length: u32 BE] [H.264 data...]
 ///   flags: bit 0 = keyframe
-async fn send_video_frame(
-    session: &wtransport::Connection,
-    frame: &EncodedFrame,
-) -> Result<()> {
+async fn send_video_frame(session: &wtransport::Connection, frame: &EncodedFrame) -> Result<()> {
     let mut stream = session.open_uni().await?.await?;
 
     let flags: u8 = if frame.is_keyframe { 0x01 } else { 0x00 };
@@ -259,52 +257,17 @@ fn process_input_data(
             break;
         }
 
-        if let Some(event) = parse_input_event(&remaining[..event_len]) {
-            if let Err(e) = dispatch_event(&event, input_handler, pipeline_controller) {
-                warn!("Failed to dispatch input event: {}", e);
-            }
+        if let Some(event) = parse_input_event(&remaining[..event_len])
+            && let Err(e) = dispatch_event(&event, input_handler, pipeline_controller)
+        {
+            warn!("Failed to dispatch input event: {}", e);
         }
 
         offset += event_len;
     }
 }
 
-fn estimate_event_length(data: &[u8]) -> usize {
-    if data.is_empty() {
-        return 0;
-    }
-    match data[0] {
-        0x01 => 5, // Mouse Move
-        0x02 => 3, // Mouse Button
-        0x03 => 5, // Mouse Scroll
-        0x10 => {
-            if data.len() < 2 {
-                return 0;
-            }
-            let code_len = data[1] as usize;
-            2 + code_len + 1
-        }
-        0x20 => {
-            if data.len() < 5 {
-                return 0;
-            }
-            let length = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-            5 + length
-        }
-        0x30 => {
-            if data.len() < 2 {
-                return 0;
-            }
-            match data[1] {
-                0x01 => 2,
-                0x02 => 6,
-                0x03 => 6,
-                _ => 0,
-            }
-        }
-        _ => 0,
-    }
-}
+// estimate_event_length moved to input.rs
 
 fn dispatch_event(
     event: &InputEvent,
@@ -335,13 +298,7 @@ fn start_xvfb(config: &Config) -> Result<()> {
     info!("Starting Xvfb on display {}", disp);
 
     Command::new("Xvfb")
-        .args([
-            disp,
-            "-screen",
-            "0",
-            &format!("{}x24", resolution),
-            "-ac",
-        ])
+        .args([disp, "-screen", "0", &format!("{}x24", resolution), "-ac"])
         .spawn()
         .context("Failed to start Xvfb")?;
 
@@ -393,9 +350,7 @@ async fn run_http_server(addr: SocketAddr, client_dir: String) -> Result<()> {
 
                     match tokio::fs::read(&file_path).await {
                         Ok(contents) => {
-                            let content_type = match file_path
-                                .extension()
-                                .and_then(|e| e.to_str())
+                            let content_type = match file_path.extension().and_then(|e| e.to_str())
                             {
                                 Some("html") => "text/html; charset=utf-8",
                                 Some("js") => "application/javascript; charset=utf-8",
@@ -411,17 +366,13 @@ async fn run_http_server(addr: SocketAddr, client_dir: String) -> Result<()> {
                                 Response::builder()
                                     .header("Content-Type", content_type)
                                     .header("Access-Control-Allow-Origin", "*")
-                                    .body(http_body_util::Full::new(bytes::Bytes::from(
-                                        contents,
-                                    )))
+                                    .body(http_body_util::Full::new(bytes::Bytes::from(contents)))
                                     .unwrap(),
                             )
                         }
                         Err(_) => Ok(Response::builder()
                             .status(404)
-                            .body(http_body_util::Full::new(bytes::Bytes::from(
-                                "Not Found",
-                            )))
+                            .body(http_body_util::Full::new(bytes::Bytes::from("Not Found")))
                             .unwrap()),
                     }
                 }
