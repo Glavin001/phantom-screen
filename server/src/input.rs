@@ -220,13 +220,24 @@ pub enum InputEvent {
     SetResolution { width: u16, height: u16 },
 }
 
-/// Build a mapping from DOM KeyboardEvent.code to X11 keycode
+/// Build a mapping from DOM KeyboardEvent.code to X11 keycode.
+///
+/// Uses [`build_dom_to_x11_keycode_map`] for the actual mapping data.
 fn build_keycode_map(
     _conn: &x11rb::rust_connection::RustConnection,
     _screen_num: usize,
 ) -> Result<HashMap<String, u8>> {
-    // Static mapping from DOM KeyboardEvent.code to X11 keycode
-    // Based on standard US keyboard layout; keycodes are hardware-level
+    Ok(build_dom_to_x11_keycode_map())
+}
+
+/// Build the static mapping from DOM `KeyboardEvent.code` strings to X11 keycodes.
+///
+/// Keycodes follow the standard US QWERTY keyboard layout as reported by X11.
+/// Letter keycodes are assigned by physical row position (not alphabetical order):
+///   Row 1 (QWERTY):  Q=24  W=25  E=26  R=27  T=28  Y=29  U=30  I=31  O=32  P=33
+///   Row 2 (ASDF):    A=38  S=39  D=40  F=41  G=42  H=43  J=44  K=45  L=46
+///   Row 3 (ZXCV):    Z=52  X=53  C=54  V=55  B=56  N=57  M=58
+fn build_dom_to_x11_keycode_map() -> HashMap<String, u8> {
     let mut map = HashMap::new();
 
     // Letters — X11 keycodes follow physical QWERTY layout, not alphabetical order
@@ -247,10 +258,12 @@ fn build_keycode_map(
         map.insert(format!("Digit{}", i), if i == 0 { 19 } else { 10 + i - 1 });
     }
 
-    // Function keys
-    for i in 1..=12u8 {
+    // Function keys (F1–F10 are 67–76, F11=95, F12=96 on standard X11)
+    for i in 1..=10u8 {
         map.insert(format!("F{}", i), 66 + i);
     }
+    map.insert("F11".into(), 95);
+    map.insert("F12".into(), 96);
 
     // Modifiers
     map.insert("ShiftLeft".into(), 50);
@@ -295,10 +308,17 @@ fn build_keycode_map(
     map.insert("Slash".into(), 61);
     map.insert("Backquote".into(), 49);
 
-    // Numpad
-    for i in 0..=9u8 {
-        map.insert(format!("Numpad{}", i), 90 + i);
-    }
+    // Numpad — keycodes follow physical layout, not numeric order
+    map.insert("Numpad0".into(), 90);
+    map.insert("Numpad1".into(), 87);
+    map.insert("Numpad2".into(), 88);
+    map.insert("Numpad3".into(), 89);
+    map.insert("Numpad4".into(), 83);
+    map.insert("Numpad5".into(), 84);
+    map.insert("Numpad6".into(), 85);
+    map.insert("Numpad7".into(), 79);
+    map.insert("Numpad8".into(), 80);
+    map.insert("Numpad9".into(), 81);
     map.insert("NumpadEnter".into(), 104);
     map.insert("NumpadAdd".into(), 86);
     map.insert("NumpadSubtract".into(), 82);
@@ -312,7 +332,7 @@ fn build_keycode_map(
     map.insert("ScrollLock".into(), 78);
     map.insert("Pause".into(), 127);
 
-    Ok(map)
+    map
 }
 
 /// Estimate the byte length of a binary-encoded input event.
@@ -526,5 +546,207 @@ mod tests {
     #[test]
     fn test_parse_unknown_type() {
         assert!(parse_input_event(&[0xFF, 0x00]).is_none());
+    }
+
+    // ── Keycode mapping tests ─────────────────────────────────────────
+
+    #[test]
+    fn keycode_map_contains_all_26_letters() {
+        let map = build_dom_to_x11_keycode_map();
+        for c in 'A'..='Z' {
+            let code = format!("Key{}", c);
+            assert!(map.contains_key(&code), "Missing mapping for {}", code);
+        }
+    }
+
+    #[test]
+    fn keycode_map_letter_keycodes_are_unique() {
+        let map = build_dom_to_x11_keycode_map();
+        let mut seen: HashMap<u8, String> = HashMap::new();
+        for c in 'A'..='Z' {
+            let code = format!("Key{}", c);
+            let keycode = map[&code];
+            if let Some(prev) = seen.get(&keycode) {
+                panic!(
+                    "Duplicate keycode {}: both {} and {} map to it",
+                    keycode, prev, code
+                );
+            }
+            seen.insert(keycode, code);
+        }
+    }
+
+    /// Verify letter keycodes match the standard X11 QWERTY layout.
+    /// These values come from `xmodmap -pke` on a standard US keyboard.
+    #[test]
+    fn keycode_map_qwerty_row1() {
+        let map = build_dom_to_x11_keycode_map();
+        // Top row: Q W E R T Y U I O P
+        assert_eq!(map["KeyQ"], 24);
+        assert_eq!(map["KeyW"], 25);
+        assert_eq!(map["KeyE"], 26);
+        assert_eq!(map["KeyR"], 27);
+        assert_eq!(map["KeyT"], 28);
+        assert_eq!(map["KeyY"], 29);
+        assert_eq!(map["KeyU"], 30);
+        assert_eq!(map["KeyI"], 31);
+        assert_eq!(map["KeyO"], 32);
+        assert_eq!(map["KeyP"], 33);
+    }
+
+    #[test]
+    fn keycode_map_qwerty_row2() {
+        let map = build_dom_to_x11_keycode_map();
+        // Home row: A S D F G H J K L
+        assert_eq!(map["KeyA"], 38);
+        assert_eq!(map["KeyS"], 39);
+        assert_eq!(map["KeyD"], 40);
+        assert_eq!(map["KeyF"], 41);
+        assert_eq!(map["KeyG"], 42);
+        assert_eq!(map["KeyH"], 43);
+        assert_eq!(map["KeyJ"], 44);
+        assert_eq!(map["KeyK"], 45);
+        assert_eq!(map["KeyL"], 46);
+    }
+
+    #[test]
+    fn keycode_map_qwerty_row3() {
+        let map = build_dom_to_x11_keycode_map();
+        // Bottom row: Z X C V B N M
+        assert_eq!(map["KeyZ"], 52);
+        assert_eq!(map["KeyX"], 53);
+        assert_eq!(map["KeyC"], 54);
+        assert_eq!(map["KeyV"], 55);
+        assert_eq!(map["KeyB"], 56);
+        assert_eq!(map["KeyN"], 57);
+        assert_eq!(map["KeyM"], 58);
+    }
+
+    /// Guard against the original bug: letters must NOT be mapped sequentially.
+    /// If KeyB == KeyA + 1, the mapping is alphabetical (wrong) instead of QWERTY.
+    #[test]
+    fn keycode_map_letters_are_not_sequential_alphabetical() {
+        let map = build_dom_to_x11_keycode_map();
+        let a = map["KeyA"];
+        let b = map["KeyB"];
+        assert_ne!(
+            b,
+            a + 1,
+            "KeyB should not be KeyA+1 (that's alphabetical, not QWERTY)"
+        );
+        let l = map["KeyL"];
+        assert_ne!(
+            l,
+            a + 11,
+            "KeyL should not be KeyA+11 (that's alphabetical, not QWERTY)"
+        );
+    }
+
+    #[test]
+    fn keycode_map_letter_keycodes_do_not_collide_with_special_keys() {
+        let map = build_dom_to_x11_keycode_map();
+        let letter_keycodes: Vec<u8> = ('A'..='Z')
+            .map(|c| map[&format!("Key{}", c)])
+            .collect();
+
+        let special_keys = [
+            "Space", "Enter", "Tab", "Escape", "Backspace",
+            "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight",
+            "AltLeft", "AltRight",
+        ];
+        for key in special_keys {
+            let kc = map[key];
+            assert!(
+                !letter_keycodes.contains(&kc),
+                "{} (keycode {}) collides with a letter key",
+                key,
+                kc
+            );
+        }
+    }
+
+    #[test]
+    fn keycode_map_digits() {
+        let map = build_dom_to_x11_keycode_map();
+        assert_eq!(map["Digit1"], 10);
+        assert_eq!(map["Digit2"], 11);
+        assert_eq!(map["Digit9"], 18);
+        assert_eq!(map["Digit0"], 19);
+    }
+
+    #[test]
+    fn keycode_map_special_keys() {
+        let map = build_dom_to_x11_keycode_map();
+        assert_eq!(map["Space"], 65);
+        assert_eq!(map["Enter"], 36);
+        assert_eq!(map["Tab"], 23);
+        assert_eq!(map["Escape"], 9);
+        assert_eq!(map["Backspace"], 22);
+    }
+
+    #[test]
+    fn keycode_map_arrow_keys() {
+        let map = build_dom_to_x11_keycode_map();
+        assert_eq!(map["ArrowUp"], 111);
+        assert_eq!(map["ArrowDown"], 116);
+        assert_eq!(map["ArrowLeft"], 113);
+        assert_eq!(map["ArrowRight"], 114);
+    }
+
+    #[test]
+    fn keycode_map_no_duplicate_keycodes_across_entire_map() {
+        let map = build_dom_to_x11_keycode_map();
+        let mut keycode_to_codes: HashMap<u8, Vec<&String>> = HashMap::new();
+        for (code, &keycode) in &map {
+            keycode_to_codes.entry(keycode).or_default().push(code);
+        }
+        for (keycode, codes) in &keycode_to_codes {
+            if codes.len() > 1 {
+                panic!(
+                    "Keycode {} is mapped by multiple DOM codes: {:?}",
+                    keycode, codes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keycode_map_function_keys() {
+        let map = build_dom_to_x11_keycode_map();
+        // F1–F10 are sequential 67–76
+        for i in 1..=10u8 {
+            assert_eq!(map[&format!("F{}", i)], 66 + i, "F{} keycode wrong", i);
+        }
+        // F11 and F12 are at 95 and 96 (not 77/78 which are NumLock/ScrollLock)
+        assert_eq!(map["F11"], 95);
+        assert_eq!(map["F12"], 96);
+    }
+
+    #[test]
+    fn keycode_map_numpad() {
+        let map = build_dom_to_x11_keycode_map();
+        assert_eq!(map["Numpad7"], 79);
+        assert_eq!(map["Numpad8"], 80);
+        assert_eq!(map["Numpad9"], 81);
+        assert_eq!(map["Numpad4"], 83);
+        assert_eq!(map["Numpad5"], 84);
+        assert_eq!(map["Numpad6"], 85);
+        assert_eq!(map["Numpad1"], 87);
+        assert_eq!(map["Numpad2"], 88);
+        assert_eq!(map["Numpad3"], 89);
+        assert_eq!(map["Numpad0"], 90);
+        assert_eq!(map["NumpadDecimal"], 91);
+        assert_eq!(map["NumpadEnter"], 104);
+    }
+
+    /// Guard against sequential numpad bug: Numpad1 must NOT be Numpad0+1.
+    #[test]
+    fn keycode_map_numpad_not_sequential() {
+        let map = build_dom_to_x11_keycode_map();
+        assert_ne!(
+            map["Numpad1"],
+            map["Numpad0"] + 1,
+            "Numpad1 must not be Numpad0+1 (numpad layout is not sequential)"
+        );
     }
 }
