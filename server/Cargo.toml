@@ -1,0 +1,33 @@
+[package]
+name = "phantom-screen-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# CLI and config
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# GStreamer
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+
+# X11 input injection
+x11rb = { version = "0.13", features = ["xtest", "randr"] }
+
+# WebTransport / HTTP serving
+wtransport = "0.7"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+
+# Auth
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+
+# Misc
+anyhow = "1"
