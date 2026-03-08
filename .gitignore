@@ -1,6 +1,5 @@
 # Rust
 server/target/
-server/Cargo.lock
 
 # Node
 client/node_modules/
