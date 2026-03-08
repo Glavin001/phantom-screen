@@ -17,16 +17,34 @@ export class ControlManager {
   private send: InputSender;
   private ui: UIElements;
   private statsInterval: number;
+  private resizeTimeout: number | undefined;
+  private readonly onKeyframeClick: () => void;
+  private readonly onWindowResize: () => void;
 
   constructor(send: InputSender, ui: UIElements) {
     this.send = send;
     this.ui = ui;
+    this.onKeyframeClick = () => this.requestKeyframe();
+    this.onWindowResize = () => {
+      clearTimeout(this.resizeTimeout);
+      this.resizeTimeout = window.setTimeout(() => {
+        // Only request if significantly different from current
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        if (
+          Math.abs(width - this.remoteWidth) > 100 ||
+          Math.abs(height - this.remoteHeight) > 100
+        ) {
+          this.send(encodeResolutionRequest(width, height));
+        }
+      }, 500);
+    };
 
     // Update stats display every second
     this.statsInterval = window.setInterval(() => this.updateFps(), 1000);
 
     // Setup keyframe button
-    ui.keyframeBtn.addEventListener('click', () => this.requestKeyframe());
+    ui.keyframeBtn.addEventListener('click', this.onKeyframeClick);
 
     // Setup resize observer
     this.setupResizeObserver();
@@ -67,6 +85,9 @@ export class ControlManager {
   /** Clean up */
   destroy() {
     clearInterval(this.statsInterval);
+    clearTimeout(this.resizeTimeout);
+    this.ui.keyframeBtn.removeEventListener('click', this.onKeyframeClick);
+    window.removeEventListener('resize', this.onWindowResize);
   }
 
   private updateFps() {
@@ -86,21 +107,6 @@ export class ControlManager {
 
   private setupResizeObserver() {
     // When the browser window resizes, we could request a resolution change
-    let resizeTimeout: number;
-    window.addEventListener('resize', () => {
-      clearTimeout(resizeTimeout);
-      resizeTimeout = window.setTimeout(() => {
-        // Only request if significantly different from current
-        const w = window.innerWidth;
-        const h = window.innerHeight;
-        if (
-          Math.abs(w - this.remoteWidth) > 100 ||
-          Math.abs(h - this.remoteHeight) > 100
-        ) {
-          // Send resolution change request
-          this.send(encodeResolutionRequest(w, h));
-        }
-      }, 500);
-    });
+    window.addEventListener('resize', this.onWindowResize);
   }
 }

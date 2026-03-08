@@ -91,11 +91,11 @@ async fn main() -> Result<()> {
     });
     info!("HTTP static file server on port {}", http_addr.port());
     info!(
-        "Open https://localhost:{} in Chrome (WebTransport)",
+        "Open https://127.0.0.1:{} in Chrome (WebTransport)",
         config.listen.port()
     );
     info!(
-        "Open http://localhost:{} in browser (static files)",
+        "Open http://127.0.0.1:{} in browser (static files)",
         http_addr.port()
     );
 

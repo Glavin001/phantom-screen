@@ -113,13 +113,17 @@ else
   log_fail "HTTP server not responding for /assets/ path"
 fi
 
+# Capture container logs once (avoids SIGPIPE with pipefail when grep -q exits early)
+CONTAINER_LOGS=$(docker logs "$CONTAINER_NAME" 2>&1 || true)
+
 # ---- Test: WebTransport port is listening ----
-if docker exec "$CONTAINER_NAME" sh -c "ss -tlnp | grep -q 4443 || ss -ulnp | grep -q 4443" 2>/dev/null; then
+if docker exec "$CONTAINER_NAME" sh -c "command -v ss >/dev/null 2>&1 && ss -ltnu | grep -q ':4443 '" 2>/dev/null; then
   log_pass "WebTransport port 4443 is listening inside container"
 else
-  # Fall back to checking from host
-  if nc -z localhost "$WT_PORT" 2>/dev/null; then
-    log_pass "WebTransport port is reachable from host"
+  # Fall back to readiness logs because the slim runtime image does not ship
+  # every socket inspection tool, and nc cannot reliably probe a QUIC listener.
+  if echo "$CONTAINER_LOGS" | grep -q "WebTransport server listening"; then
+    log_pass "WebTransport server advertised port 4443 in logs"
   else
     log_fail "WebTransport port 4443 not detected"
   fi
@@ -138,9 +142,6 @@ if docker exec "$CONTAINER_NAME" pgrep -x openbox >/dev/null 2>&1; then
 else
   log_fail "Window manager is not running"
 fi
-
-# Capture container logs once (avoids SIGPIPE with pipefail when grep -q exits early)
-CONTAINER_LOGS=$(docker logs "$CONTAINER_NAME" 2>&1 || true)
 
 # ---- Test: GStreamer pipeline is active ----
 if echo "$CONTAINER_LOGS" | grep -q "GStreamer pipeline running"; then

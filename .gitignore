@@ -4,6 +4,9 @@ server/target/
 # Node
 client/node_modules/
 client/dist/
+dist/
+tests/fixtures/**/node_modules/
+tests/fixtures/**/.next/
 
 # IDE
 .vscode/
@@ -14,3 +17,6 @@ client/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local test assets
+.tmp/

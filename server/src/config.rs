@@ -40,7 +40,7 @@ pub struct Config {
     pub key: Option<String>,
 
     /// Path to web client static files directory
-    #[arg(long, default_value = "../client/dist")]
+    #[arg(long, default_value = "../client/dist/standalone")]
     pub client_dir: String,
 
     /// Skip starting Xvfb (if already running)
@@ -119,7 +119,7 @@ mod tests {
             keyframe_interval: 60,
             cert: None,
             key: None,
-            client_dir: "../client/dist".into(),
+            client_dir: "../client/dist/standalone".into(),
             no_xvfb: false,
             wm: "openbox".into(),
             jwt_secret: None,
@@ -162,7 +162,7 @@ mod tests {
             keyframe_interval: 60,
             cert: None,
             key: None,
-            client_dir: "../client/dist".into(),
+            client_dir: "../client/dist/standalone".into(),
             no_xvfb: false,
             wm: "openbox".into(),
             jwt_secret: None,
@@ -184,7 +184,7 @@ mod tests {
             keyframe_interval: 60,
             cert: None,
             key: None,
-            client_dir: "../client/dist".into(),
+            client_dir: "../client/dist/standalone".into(),
             no_xvfb: false,
             wm: "openbox".into(),
             jwt_secret: None,

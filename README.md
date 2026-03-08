@@ -1,192 +1,223 @@
 # Phantom Screen
 
-Web-based remote desktop streaming via WebTransport + WebCodecs.
+Web-based remote desktop streaming over WebTransport + WebCodecs.
 
-A remote desktop server that captures a Linux desktop using GStreamer, encodes it as H.264 video, and streams it to a browser over WebTransport. The browser decodes with hardware-accelerated WebCodecs and renders to canvas. Mouse and keyboard input flows back over the same connection.
+Phantom Screen has two deliverables:
+
+- `server/`: a Rust WebTransport server for Linux/X11 hosts.
+- `client/`: a browser client that now ships both as an embeddable npm package and as a plain HTML/IIFE bundle.
 
 ## Architecture
 
+```text
+SERVER (Linux/X11)                         CLIENT (browser)
+┌──────────────────────┐                   ┌─────────────────────────┐
+│ Xvfb / real display  │                   │ WebTransport            │
+│ + window manager     │                   │ + WebCodecs decode      │
+└──────────┬───────────┘                   └──────────┬──────────────┘
+           │ X11 capture                                 │
+┌──────────┴───────────┐       H.264 over QUIC           │
+│ GStreamer pipeline   │ ===============================>│
+│ ximagesrc -> x264enc │                                 │
+└──────────────────────┘                                 │
+           ^                                             │
+           └──────────── input + clipboard ──────────────┘
 ```
-SERVER (Linux container)                    CLIENT (Chrome)
-┌───────────────────┐                       ┌──────────────────────┐
-│  Xvfb (:99)       │                       │  WebTransport        │
-│  Virtual Display   │                       │  + WebCodecs decode  │
-│  + Window Manager  │                       │                      │
-└────────┬──────────┘                       │  Video → Canvas      │
-         │ XShmGetImage                      │                      │
-┌────────┴──────────┐                       │  Input events        │
-│  GStreamer Pipeline│    WebTransport       │  → server via        │
-│  ximagesrc →       │ ═══════════════════> │     bidi stream      │
-│  x264enc →         │  (single HTTPS port)  │                      │
-│  appsink           │                       │                      │
-└───────────────────┘                       └──────────────────────┘
-```
 
-## Features
+## Release artifacts
 
-- **Screen capture**: GStreamer `ximagesrc` at up to 60fps
-- **H.264 encoding**: Software (`x264enc`) with auto-upgrade to `nvh264enc` (NVIDIA) or `vaapih264enc` (AMD/Intel)
-- **Transport**: WebTransport over QUIC — no head-of-line blocking, no STUN/TURN
-- **Browser decode**: WebCodecs `VideoDecoder` with `hardwareAcceleration: 'prefer-hardware'`
-- **Input**: Full mouse (move, click, scroll) and keyboard via X11 XTest injection
-- **Clipboard**: Bidirectional text clipboard sync
-- **Adaptive quality**: Keyframe-on-demand, encoder bitrate adjustment
-- **Single port**: All traffic over one HTTPS/WebTransport port
-- **Docker ready**: Single container deployment
+Every `main` commit produces immutable GitHub Release assets tagged as `build-<commit-sha>`.
 
-## Quick Start
+Artifacts include:
 
-### Prerequisites
+- `phantom-screen-server-<version>-linux-x64.tar.gz`
+- `phantom-screen-server-<version>-linux-arm64.tar.gz`
+- `phantom-screen-web-client-<version>.tgz` for `npm install <tarball>`
+- `phantom-screen-html-client-<version>.tar.gz` with `phantom-screen-client.iife.js`
+- `phantom-screen-standalone-client-<version>.tar.gz`
 
-- Linux with X11 (or headless with Xvfb)
-- GStreamer 1.20+ with plugins
-- Rust (latest stable)
-- Node.js 20+
-- Chrome browser
+Every CI run also uploads the same distributables as workflow artifacts before any release publish step.
 
-### Install System Dependencies (Debian/Ubuntu)
+## Install the server bundle
+
+The server bundle targets Linux because the capture pipeline depends on X11 + GStreamer.
+
+### Runtime packages (Debian/Ubuntu)
 
 ```bash
-apt-get install -y \
+sudo apt-get install -y \
   xvfb openbox \
   gstreamer1.0-tools gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-ugly gstreamer1.0-x \
-  xdotool xclip \
-  pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  libx11-dev libxcb1-dev libxcb-xtest0-dev
+  xdotool xclip
 ```
 
-### Build & Run
+### Run from a release archive
 
 ```bash
-# Build client
+tar -xzf phantom-screen-server-0.1.0-linux-x64.tar.gz
+cd phantom-screen-server-0.1.0-linux-x64
+
+bash ./tools/generate-dev-cert.sh ./certs
+
+./run-server.sh \
+  --display :99 \
+  --resolution 1280x720 \
+  --fps 15 \
+  --bitrate 3000 \
+  --cert ./certs/cert.pem \
+  --key ./certs/key.pem
+```
+
+The wrapper script points the binary at the bundled standalone client automatically.
+
+## Install the browser client in an app
+
+### Install from a release tarball
+
+```bash
+npm install ./phantom-screen-web-client-0.1.0.tgz
+```
+
+### Next.js / React example
+
+```tsx
+'use client';
+
+import { useEffect, useRef } from 'react';
+import { mountPhantomScreen } from '@phantom-screen/web-client';
+
+export function RemoteDesktop() {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!ref.current) return;
+
+    const client = mountPhantomScreen(ref.current, {
+      serverUrl: 'https://127.0.0.1:4443',
+      serverCertificateHash: process.env.NEXT_PUBLIC_PHANTOM_CERT_HASH,
+    });
+
+    return () => client.destroy();
+  }, []);
+
+  return <div ref={ref} style={{ width: '100%', height: '70vh' }} />;
+}
+```
+
+### Plain HTML bundle example
+
+```html
+<div id="remote-desktop" style="height:70vh"></div>
+<script src="./phantom-screen-client.iife.js"></script>
+<script>
+  window.PhantomScreenClient.mountPhantomScreen(
+    document.getElementById('remote-desktop'),
+    {
+      serverUrl: 'https://127.0.0.1:4443',
+      serverCertificateHash: 'paste-the-sha256-cert-hash-here',
+    },
+  );
+</script>
+```
+
+The release HTML bundle archive also includes `embed.html` as a ready-to-edit example page.
+
+## Build from source
+
+### Prerequisites
+
+- Linux with X11 or Xvfb for the server
+- GStreamer 1.20+ with plugins
+- Rust stable
+- Node.js 20+
+- Chrome or Edge for the client
+
+### Build the client and server
+
+```bash
 cd client
 npm install
 npm run build
 cd ..
 
-# Build server
 cd server
 cargo build --release
 cd ..
+```
 
-# Run (starts Xvfb, window manager, and streaming server)
+Client output directories:
+
+- `client/dist/npm`: npm-consumable ESM/CJS bundle + types
+- `client/dist/html`: plain browser IIFE bundle
+- `client/dist/standalone`: standalone web app served by the server
+
+## Local end-to-end test flow
+
+`WebTransport` does not trust self-signed certs just because the browser ignores normal HTTPS errors. Use certificate hashes instead, and make sure the development certificate is WebTransport-compatible (ECDSA P-256 and short-lived; Chrome rejects the old RSA/365-day profile during the QUIC handshake).
+
+### 1. Generate a dev cert and copy the printed SHA-256 hash
+
+```bash
+bash scripts/generate-dev-cert.sh ./.tmp/dev-cert
+```
+
+### 2. Start the server with the generated cert
+
+```bash
 ./server/target/release/phantom-screen-server \
   --display :99 \
-  --resolution 1920x1080 \
-  --fps 30 \
-  --bitrate 6000
-
-# Open in Chrome: https://localhost:4443
-# Static files served on http://localhost:4444
+  --resolution 1280x720 \
+  --fps 15 \
+  --bitrate 3000 \
+  --client-dir ./client/dist/standalone \
+  --cert ./.tmp/dev-cert/cert.pem \
+  --key ./.tmp/dev-cert/key.pem
 ```
 
-### Docker
+### 3. Open the standalone client
+
+Use the printed hash either in the form input or directly in the URL:
+
+```text
+http://127.0.0.1:4444/?serverUrl=https://127.0.0.1:4443&certHash=<hex-or-base64-hash>&autoconnect=1
+```
+
+The packaged client defaults to software decoding (`prefer-software`) so it works on cloud VMs and other environments without GPU decode support.
+
+## Docker
 
 ```bash
-# Build
 docker build -t phantom-screen -f server/Dockerfile .
-
-# Run
-docker run -p 4443:4443/udp -p 4443:4443/tcp -p 4444:4444/tcp \
-  phantom-screen
-
-# Open in Chrome: https://localhost:4443
+docker run -p 4443:4443/udp -p 4443:4443/tcp -p 4444:4444/tcp phantom-screen
 ```
-
-### Chrome Self-Signed Certificate
-
-For development with self-signed certificates, launch Chrome with:
-
-```bash
-chrome --ignore-certificate-errors --origin-to-force-quic-on=localhost:4443
-```
-
-Or navigate to `chrome://flags/#allow-insecure-localhost` and enable it.
 
 ## Configuration
 
-```
+```text
 USAGE: phantom-screen-server [OPTIONS]
 
 OPTIONS:
   --display <DISPLAY>          X11 display to capture [default: :99]
   --resolution <WxH>           Virtual display resolution [default: 1920x1080]
   --listen <ADDR:PORT>         Listen address [default: 0.0.0.0:4443]
-  --fps <N>                    Video framerate [default: 30]
+  --fps <N>                    Video framerate [default: 60]
   --bitrate <KBPS>             H.264 bitrate in kbps [default: 6000]
   --keyframe-interval <N>      Keyframe interval in frames [default: 60]
   --cert <PATH>                TLS certificate PEM file
   --key <PATH>                 TLS private key PEM file
-  --client-dir <PATH>          Web client files directory [default: ../client/dist]
+  --client-dir <PATH>          Web client files directory [default: ../client/dist/standalone]
   --no-xvfb                    Skip starting Xvfb
   --wm <COMMAND>               Window manager command [default: openbox]
   --jwt-secret <SECRET>        JWT secret for auth (env: PHANTOM_JWT_SECRET)
 ```
 
-## Input Protocol
-
-Binary protocol over WebTransport bidirectional stream:
-
-| Event | Format | Size |
-|-------|--------|------|
-| Mouse Move | `[0x01] [x: u16] [y: u16]` | 5 bytes |
-| Mouse Button | `[0x02] [button: u8] [pressed: u8]` | 3 bytes |
-| Mouse Scroll | `[0x03] [dx: i16] [dy: i16]` | 5 bytes |
-| Key Event | `[0x10] [code_len: u8] [code: utf8] [pressed: u8]` | variable |
-| Clipboard | `[0x20] [length: u32] [utf8 data...]` | variable |
-| Keyframe Req | `[0x30] [0x01]` | 2 bytes |
-| Set Bitrate | `[0x30] [0x02] [kbps: u32]` | 6 bytes |
-| Set Resolution | `[0x30] [0x03] [w: u16] [h: u16]` | 6 bytes |
-
-Keyboard events use `KeyboardEvent.code` strings (e.g., "KeyA", "ShiftLeft", "Enter").
-
-## Project Structure
-
-```
-phantom-screen/
-├── server/                     # Rust server
-│   ├── Cargo.toml
-│   ├── Dockerfile
-│   └── src/
-│       ├── main.rs             # Entry point, WebTransport server, static files
-│       ├── config.rs           # CLI args, encoder auto-detection
-│       ├── pipeline.rs         # GStreamer pipeline construction
-│       ├── input.rs            # Input protocol parsing, X11 XTest injection
-│       └── control.rs          # Keyframe/bitrate/resolution control
-├── client/                     # TypeScript web client
-│   ├── index.html              # Single-page UI
-│   ├── package.json
-│   ├── tsconfig.json
-│   ├── vite.config.ts
-│   └── src/
-│       ├── main.ts             # Entry: WebTransport, WebCodecs, video rendering
-│       ├── input.ts            # Mouse/keyboard capture + binary serialization
-│       ├── clipboard.ts        # Clipboard sync
-│       ├── control.ts          # Stats, keyframe requests, resolution negotiation
-│       └── ui.ts               # Fullscreen, cursor, status bar, auto-hide
-└── README.md
-```
-
-## Target Latency
-
-| Environment | Expected Latency |
-|-------------|-----------------|
-| LAN / Tailscale | 25–50ms |
-| Good internet | 50–80ms |
-| Software encode (no GPU) | +8–15ms encode |
-| Hardware encode (GPU) | +2–5ms encode |
-
-## Browser Support
+## Browser support
 
 | Browser | Status |
 |---------|--------|
 | Chrome 97+ | Supported |
 | Edge 97+ | Supported |
 | Firefox 130+ | Experimental |
-| Safari | Pending (WebTransport in stable) |
-
-## License
-
-MIT
+| Safari | Pending |
