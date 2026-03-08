@@ -139,15 +139,18 @@ else
   log_fail "Window manager is not running"
 fi
 
+# Capture container logs once (avoids SIGPIPE with pipefail when grep -q exits early)
+CONTAINER_LOGS=$(docker logs "$CONTAINER_NAME" 2>&1 || true)
+
 # ---- Test: GStreamer pipeline is active ----
-if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "GStreamer pipeline running"; then
+if echo "$CONTAINER_LOGS" | grep -q "GStreamer pipeline running"; then
   log_pass "GStreamer pipeline initialized"
 else
   log_fail "GStreamer pipeline did not initialize"
 fi
 
 # ---- Test: Server is accepting sessions ----
-if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "WebTransport server listening"; then
+if echo "$CONTAINER_LOGS" | grep -q "WebTransport server listening"; then
   log_pass "WebTransport server is accepting sessions"
 else
   log_fail "WebTransport server not ready"
@@ -162,7 +165,7 @@ else
 fi
 
 # ---- Test: Resolution was applied ----
-if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "1280x720"; then
+if echo "$CONTAINER_LOGS" | grep -q "1280x720"; then
   log_pass "Custom resolution 1280x720 was applied"
 else
   log_fail "Custom resolution not detected in logs"
@@ -177,7 +180,7 @@ echo "====================================="
 if [ $fail -gt 0 ]; then
   echo ""
   echo "Container logs:"
-  docker logs "$CONTAINER_NAME" 2>&1 | tail -30
+  echo "$CONTAINER_LOGS" | tail -30
   exit 1
 fi
 
