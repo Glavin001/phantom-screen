@@ -38,7 +38,7 @@ FROM node:22-slim AS client-builder
 
 WORKDIR /build
 COPY client/package.json client/package-lock.json* ./
-RUN npm install
+RUN npm ci
 
 COPY client/ ./
 RUN npm run build
@@ -49,8 +49,8 @@ FROM base
 # Copy server binary
 COPY --from=builder /build/target/release/phantom-screen-server /usr/local/bin/phantom-screen-server
 
-# Copy client dist
-COPY --from=client-builder /build/dist /var/www/phantom-screen/
+# Copy standalone client app
+COPY --from=client-builder /build/dist/standalone /var/www/phantom-screen/
 
 EXPOSE 4443/udp
 EXPOSE 4443/tcp

@@ -3,6 +3,7 @@
  */
 
 export interface UIElements {
+  root: HTMLElement;
   container: HTMLElement;
   canvas: HTMLCanvasElement;
   statusDot: HTMLElement;
@@ -12,6 +13,8 @@ export interface UIElements {
   connectScreen: HTMLElement;
   errorMsg: HTMLElement;
   connectBtn: HTMLButtonElement;
+  serverUrlInput: HTMLInputElement;
+  certHashInput: HTMLInputElement;
   fullscreenBtn: HTMLButtonElement;
   pointerLockBtn: HTMLButtonElement;
   keyframeBtn: HTMLButtonElement;
@@ -19,35 +22,48 @@ export interface UIElements {
   toolbar: HTMLElement;
 }
 
-export function getUIElements(): UIElements {
+function query<T extends Element>(root: ParentNode, name: string): T {
+  const element = root.querySelector<T>(`[data-phantom-screen="${name}"]`);
+  if (!element) {
+    throw new Error(`Missing Phantom Screen UI element: ${name}`);
+  }
+  return element;
+}
+
+export function getUIElements(root: ParentNode): UIElements {
   return {
-    container: document.getElementById('container')!,
-    canvas: document.getElementById('desktop-canvas') as HTMLCanvasElement,
-    statusDot: document.getElementById('status-dot')!,
-    statusText: document.getElementById('status-text')!,
-    stats: document.getElementById('stats')!,
-    resolutionDisplay: document.getElementById('resolution-display')!,
-    connectScreen: document.getElementById('connect-screen')!,
-    errorMsg: document.getElementById('error-msg')!,
-    connectBtn: document.getElementById('connect-btn') as HTMLButtonElement,
-    fullscreenBtn: document.getElementById('fullscreen-btn') as HTMLButtonElement,
-    pointerLockBtn: document.getElementById('pointer-lock-btn') as HTMLButtonElement,
-    keyframeBtn: document.getElementById('keyframe-btn') as HTMLButtonElement,
-    statusBar: document.getElementById('status-bar')!,
-    toolbar: document.getElementById('toolbar')!,
+    root: query<HTMLElement>(root, 'root'),
+    container: query<HTMLElement>(root, 'container'),
+    canvas: query<HTMLCanvasElement>(root, 'desktop-canvas'),
+    statusDot: query<HTMLElement>(root, 'status-dot'),
+    statusText: query<HTMLElement>(root, 'status-text'),
+    stats: query<HTMLElement>(root, 'stats'),
+    resolutionDisplay: query<HTMLElement>(root, 'resolution-display'),
+    connectScreen: query<HTMLElement>(root, 'connect-screen'),
+    errorMsg: query<HTMLElement>(root, 'error-msg'),
+    connectBtn: query<HTMLButtonElement>(root, 'connect-btn'),
+    serverUrlInput: query<HTMLInputElement>(root, 'server-url'),
+    certHashInput: query<HTMLInputElement>(root, 'cert-hash'),
+    fullscreenBtn: query<HTMLButtonElement>(root, 'fullscreen-btn'),
+    pointerLockBtn: query<HTMLButtonElement>(root, 'pointer-lock-btn'),
+    keyframeBtn: query<HTMLButtonElement>(root, 'keyframe-btn'),
+    statusBar: query<HTMLElement>(root, 'status-bar'),
+    toolbar: query<HTMLElement>(root, 'toolbar'),
   };
 }
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 export function setConnectionState(ui: UIElements, state: ConnectionState, message?: string) {
-  ui.statusDot.className = 'status-dot ' + (state === 'connected' ? 'connected' : state === 'connecting' ? 'connecting' : state === 'error' ? 'error' : '');
+  ui.statusDot.className = 'phantom-screen-status-dot ' + (state === 'connected' ? 'connected' : state === 'connecting' ? 'connecting' : state === 'error' ? 'error' : '');
   ui.statusText.textContent = message ?? state.charAt(0).toUpperCase() + state.slice(1);
 
   if (state === 'connected') {
-    ui.connectScreen.classList.add('hidden');
+    ui.connectScreen.classList.add('phantom-screen-hidden');
+    ui.errorMsg.textContent = '';
+    ui.connectBtn.disabled = false;
   } else if (state === 'disconnected' || state === 'error') {
-    ui.connectScreen.classList.remove('hidden');
+    ui.connectScreen.classList.remove('phantom-screen-hidden');
     ui.connectBtn.disabled = false;
     if (message) {
       ui.errorMsg.textContent = message;
@@ -68,42 +84,50 @@ export function updateResolution(ui: UIElements, width: number, height: number) 
 
 /** Setup fullscreen toggle */
 export function setupFullscreen(ui: UIElements) {
-  ui.fullscreenBtn.addEventListener('click', () => {
+  const toggleFullscreen = () => {
     if (document.fullscreenElement) {
-      document.exitFullscreen();
+      void document.exitFullscreen();
     } else {
-      ui.container.requestFullscreen();
+      void ui.root.requestFullscreen();
     }
-  });
+  };
 
   // F11 shortcut is handled by the input capture (forwarded to remote)
   // Double-click on canvas to toggle fullscreen
-  ui.canvas.addEventListener('dblclick', () => {
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    } else {
-      ui.container.requestFullscreen();
-    }
-  });
+  ui.fullscreenBtn.addEventListener('click', toggleFullscreen);
+  ui.canvas.addEventListener('dblclick', toggleFullscreen);
+
+  return () => {
+    ui.fullscreenBtn.removeEventListener('click', toggleFullscreen);
+    ui.canvas.removeEventListener('dblclick', toggleFullscreen);
+  };
 }
 
 /** Setup pointer lock toggle */
 export function setupPointerLock(ui: UIElements) {
-  ui.pointerLockBtn.addEventListener('click', () => {
-    if (document.pointerLockElement === ui.canvas) {
-      document.exitPointerLock();
-      ui.pointerLockBtn.textContent = 'Lock Pointer';
-    } else {
-      ui.canvas.requestPointerLock();
-      ui.pointerLockBtn.textContent = 'Unlock Pointer';
-    }
-  });
-
-  document.addEventListener('pointerlockchange', () => {
+  const onPointerLockChange = () => {
     if (document.pointerLockElement !== ui.canvas) {
       ui.pointerLockBtn.textContent = 'Lock Pointer';
     }
-  });
+  };
+
+  const togglePointerLock = () => {
+    if (document.pointerLockElement === ui.canvas) {
+      void document.exitPointerLock();
+      ui.pointerLockBtn.textContent = 'Lock Pointer';
+    } else {
+      void ui.canvas.requestPointerLock();
+      ui.pointerLockBtn.textContent = 'Unlock Pointer';
+    }
+  };
+
+  ui.pointerLockBtn.addEventListener('click', togglePointerLock);
+  document.addEventListener('pointerlockchange', onPointerLockChange);
+
+  return () => {
+    ui.pointerLockBtn.removeEventListener('click', togglePointerLock);
+    document.removeEventListener('pointerlockchange', onPointerLockChange);
+  };
 }
 
 /** Auto-hide toolbar and status bar after inactivity */
@@ -111,17 +135,22 @@ export function setupAutoHide(ui: UIElements) {
   let hideTimeout: number;
 
   function showUI() {
-    ui.statusBar.classList.remove('hidden');
-    ui.toolbar.classList.remove('hidden');
+    ui.statusBar.classList.remove('phantom-screen-hidden');
+    ui.toolbar.classList.remove('phantom-screen-hidden');
     clearTimeout(hideTimeout);
     hideTimeout = window.setTimeout(() => {
-      ui.statusBar.classList.add('hidden');
-      ui.toolbar.classList.add('hidden');
+      ui.statusBar.classList.add('phantom-screen-hidden');
+      ui.toolbar.classList.add('phantom-screen-hidden');
     }, 3000);
   }
 
-  ui.container.addEventListener('mousemove', showUI);
+  ui.root.addEventListener('mousemove', showUI);
   showUI();
+
+  return () => {
+    clearTimeout(hideTimeout);
+    ui.root.removeEventListener('mousemove', showUI);
+  };
 }
 
 /**
@@ -134,9 +163,11 @@ export function getCanvasScale(
   remoteHeight: number,
 ): { scaleX: number; scaleY: number; offsetX: number; offsetY: number } {
   const rect = canvas.getBoundingClientRect();
+  const width = rect.width || 1;
+  const height = rect.height || 1;
   return {
-    scaleX: remoteWidth / rect.width,
-    scaleY: remoteHeight / rect.height,
+    scaleX: remoteWidth / width,
+    scaleY: remoteHeight / height,
     offsetX: rect.left,
     offsetY: rect.top,
   };
