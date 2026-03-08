@@ -242,12 +242,32 @@ fn build_dom_to_x11_keycode_map() -> HashMap<String, u8> {
 
     // Letters — X11 keycodes follow physical QWERTY layout, not alphabetical order
     let letter_keycodes: &[(&str, u8)] = &[
-        ("KeyQ", 24), ("KeyW", 25), ("KeyE", 26), ("KeyR", 27), ("KeyT", 28),
-        ("KeyY", 29), ("KeyU", 30), ("KeyI", 31), ("KeyO", 32), ("KeyP", 33),
-        ("KeyA", 38), ("KeyS", 39), ("KeyD", 40), ("KeyF", 41), ("KeyG", 42),
-        ("KeyH", 43), ("KeyJ", 44), ("KeyK", 45), ("KeyL", 46),
-        ("KeyZ", 52), ("KeyX", 53), ("KeyC", 54), ("KeyV", 55), ("KeyB", 56),
-        ("KeyN", 57), ("KeyM", 58),
+        ("KeyQ", 24),
+        ("KeyW", 25),
+        ("KeyE", 26),
+        ("KeyR", 27),
+        ("KeyT", 28),
+        ("KeyY", 29),
+        ("KeyU", 30),
+        ("KeyI", 31),
+        ("KeyO", 32),
+        ("KeyP", 33),
+        ("KeyA", 38),
+        ("KeyS", 39),
+        ("KeyD", 40),
+        ("KeyF", 41),
+        ("KeyG", 42),
+        ("KeyH", 43),
+        ("KeyJ", 44),
+        ("KeyK", 45),
+        ("KeyL", 46),
+        ("KeyZ", 52),
+        ("KeyX", 53),
+        ("KeyC", 54),
+        ("KeyV", 55),
+        ("KeyB", 56),
+        ("KeyN", 57),
+        ("KeyM", 58),
     ];
     for &(code, keycode) in letter_keycodes {
         map.insert(code.into(), keycode);
@@ -645,14 +665,20 @@ mod tests {
     #[test]
     fn keycode_map_letter_keycodes_do_not_collide_with_special_keys() {
         let map = build_dom_to_x11_keycode_map();
-        let letter_keycodes: Vec<u8> = ('A'..='Z')
-            .map(|c| map[&format!("Key{}", c)])
-            .collect();
+        let letter_keycodes: Vec<u8> = ('A'..='Z').map(|c| map[&format!("Key{}", c)]).collect();
 
         let special_keys = [
-            "Space", "Enter", "Tab", "Escape", "Backspace",
-            "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight",
-            "AltLeft", "AltRight",
+            "Space",
+            "Enter",
+            "Tab",
+            "Escape",
+            "Backspace",
+            "ShiftLeft",
+            "ShiftRight",
+            "ControlLeft",
+            "ControlRight",
+            "AltLeft",
+            "AltRight",
         ];
         for key in special_keys {
             let kc = map[key];
