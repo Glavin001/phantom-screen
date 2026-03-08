@@ -64,7 +64,7 @@ docker run -d \
   -p "$WT_PORT:4443/tcp" \
   -p "$HTTP_PORT:4444/tcp" \
   "$IMAGE_NAME" \
-  --display=:99 --resolution=1280x720 --fps=30 >/dev/null
+  --display=:99 --resolution=1280x720 --fps=30 --client-dir=/var/www/phantom-screen >/dev/null
 
 # Wait for startup
 echo "Waiting for server to start..."
