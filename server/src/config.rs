@@ -17,7 +17,7 @@ pub struct Config {
     pub listen: SocketAddr,
 
     /// Video framerate
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 60)]
     pub fps: u32,
 
     /// H.264 bitrate in kbps

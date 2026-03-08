@@ -306,9 +306,175 @@ fn build_keycode_map(
 
 /// Fallback keycode resolution for codes not in the static map
 fn dom_code_to_keycode_fallback(code: &str) -> Option<u8> {
-    // Try common patterns
     match code {
         "ContextMenu" => Some(135),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_mouse_move() {
+        // [0x01] [x: u16 BE] [y: u16 BE]
+        let data = [0x01, 0x03, 0xE8, 0x01, 0xF4]; // x=1000, y=500
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::MouseMove { x, y } => {
+                assert_eq!(x, 1000);
+                assert_eq!(y, 500);
+            }
+            _ => panic!("Expected MouseMove"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mouse_button_press() {
+        let data = [0x02, 1, 1]; // button=1 (left), pressed=true
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::MouseButton { button, pressed } => {
+                assert_eq!(button, 1);
+                assert!(pressed);
+            }
+            _ => panic!("Expected MouseButton"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mouse_button_release() {
+        let data = [0x02, 3, 0]; // button=3 (right), pressed=false
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::MouseButton { button, pressed } => {
+                assert_eq!(button, 3);
+                assert!(!pressed);
+            }
+            _ => panic!("Expected MouseButton"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mouse_scroll() {
+        // [0x03] [dx: i16 BE] [dy: i16 BE]
+        let data = [0x03, 0xFF, 0xFE, 0x00, 0x03]; // dx=-2, dy=3
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::MouseScroll { dx, dy } => {
+                assert_eq!(dx, -2);
+                assert_eq!(dy, 3);
+            }
+            _ => panic!("Expected MouseScroll"),
+        }
+    }
+
+    #[test]
+    fn test_parse_key_event() {
+        // [0x10] [code_len: u8] [code: utf8] [pressed: u8]
+        let code = b"KeyA";
+        let mut data = vec![0x10, code.len() as u8];
+        data.extend_from_slice(code);
+        data.push(1); // pressed
+
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::KeyEvent { code, pressed } => {
+                assert_eq!(code, "KeyA");
+                assert!(pressed);
+            }
+            _ => panic!("Expected KeyEvent"),
+        }
+    }
+
+    #[test]
+    fn test_parse_key_event_release() {
+        let code = b"ShiftLeft";
+        let mut data = vec![0x10, code.len() as u8];
+        data.extend_from_slice(code);
+        data.push(0); // released
+
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::KeyEvent { code, pressed } => {
+                assert_eq!(code, "ShiftLeft");
+                assert!(!pressed);
+            }
+            _ => panic!("Expected KeyEvent"),
+        }
+    }
+
+    #[test]
+    fn test_parse_clipboard() {
+        // [0x20] [length: u32 BE] [utf8 data...]
+        let text = b"Hello, clipboard!";
+        let len = text.len() as u32;
+        let mut data = vec![0x20];
+        data.extend_from_slice(&len.to_be_bytes());
+        data.extend_from_slice(text);
+
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::Clipboard { text } => {
+                assert_eq!(text, "Hello, clipboard!");
+            }
+            _ => panic!("Expected Clipboard"),
+        }
+    }
+
+    #[test]
+    fn test_parse_keyframe_request() {
+        let data = [0x30, 0x01];
+        let event = parse_input_event(&data).unwrap();
+        assert!(matches!(event, InputEvent::RequestKeyframe));
+    }
+
+    #[test]
+    fn test_parse_set_bitrate() {
+        // [0x30] [0x02] [kbps: u32 BE]
+        let data = [0x30, 0x02, 0x00, 0x00, 0x17, 0x70]; // 6000 kbps
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::SetBitrate { kbps } => assert_eq!(kbps, 6000),
+            _ => panic!("Expected SetBitrate"),
+        }
+    }
+
+    #[test]
+    fn test_parse_set_resolution() {
+        // [0x30] [0x03] [w: u16 BE] [h: u16 BE]
+        let data = [0x30, 0x03, 0x07, 0x80, 0x04, 0x38]; // 1920x1080
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::SetResolution { width, height } => {
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+            }
+            _ => panic!("Expected SetResolution"),
+        }
+    }
+
+    #[test]
+    fn test_parse_empty_data() {
+        assert!(parse_input_event(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_truncated_mouse_move() {
+        // Only 3 bytes, need 5
+        assert!(parse_input_event(&[0x01, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn test_parse_truncated_key_event() {
+        // Says code_len=10 but only has 3 bytes of code
+        let data = [0x10, 10, b'A', b'B', b'C'];
+        assert!(parse_input_event(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_unknown_type() {
+        assert!(parse_input_event(&[0xFF, 0x00]).is_none());
     }
 }

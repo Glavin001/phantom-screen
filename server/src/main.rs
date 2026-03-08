@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod control;
 mod input;
@@ -110,6 +111,26 @@ async fn main() -> Result<()> {
 
         let path = session_request.path().to_string();
         info!("WebTransport session request for path: {}", path);
+
+        // JWT authentication (if configured)
+        if let Some(ref secret) = config.jwt_secret {
+            match auth::extract_token_from_path(&path) {
+                Some(token) => match auth::validate_token(token, secret) {
+                    Ok(data) => {
+                        info!("Authenticated session for user: {}", data.claims.sub);
+                    }
+                    Err(e) => {
+                        warn!("JWT validation failed: {}", e);
+                        // Reject by not accepting the session
+                        continue;
+                    }
+                },
+                None => {
+                    warn!("No JWT token in session path, rejecting");
+                    continue;
+                }
+            }
+        }
 
         let session = match session_request.accept().await {
             Ok(s) => s,

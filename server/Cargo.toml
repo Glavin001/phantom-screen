@@ -25,5 +25,9 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 bytes = "1"
 
+# Auth
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+
 # Misc
 anyhow = "1"
