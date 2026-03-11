@@ -52,8 +52,9 @@ impl PipelineController {
         // We need a minimal GStreamer init + a fake pipeline/element to satisfy the struct.
         gstreamer::init().expect("GStreamer init failed in test");
         let pipeline = gstreamer::Pipeline::new();
-        let fakesink =
-            gstreamer::ElementFactory::make("fakesink").build().expect("Failed to create fakesink");
+        let fakesink = gstreamer::ElementFactory::make("fakesink")
+            .build()
+            .expect("Failed to create fakesink");
         pipeline.add(&fakesink).unwrap();
         Arc::new(Self {
             pipeline,

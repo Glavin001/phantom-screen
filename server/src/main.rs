@@ -575,8 +575,7 @@ mod tests {
             let stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
             let io = TokioIo::new(stream);
 
-            let (mut sender, conn) =
-                hyper::client::conn::http1::handshake(io).await.unwrap();
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
             tokio::spawn(async move {
                 let _ = conn.await;
             });
@@ -590,7 +589,12 @@ mod tests {
             let resp = sender.send_request(req).await.unwrap();
             assert_eq!(resp.status(), 200);
 
-            let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap();
             assert_eq!(ct, "application/json");
 
             let cors = resp
@@ -624,8 +628,7 @@ mod tests {
             let stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
             let io = TokioIo::new(stream);
 
-            let (mut sender, conn) =
-                hyper::client::conn::http1::handshake(io).await.unwrap();
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
             tokio::spawn(async move {
                 let _ = conn.await;
             });
@@ -699,10 +702,7 @@ mod tests {
         fn non_control_events_are_ignored() {
             let pc = pipeline::PipelineController::new_for_test(true);
             // Passing a non-control event to handle_control_event should be a no-op
-            control::handle_control_event(
-                &InputEvent::MouseMove { x: 100, y: 200 },
-                &pc,
-            );
+            control::handle_control_event(&InputEvent::MouseMove { x: 100, y: 200 }, &pc);
         }
     }
 }
