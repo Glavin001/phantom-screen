@@ -46,6 +46,23 @@ impl PipelineController {
         self.running.load(Ordering::Relaxed)
     }
 
+    /// Create a dummy controller for testing (no real GStreamer pipeline).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(running: bool) -> Arc<Self> {
+        // We need a minimal GStreamer init + a fake pipeline/element to satisfy the struct.
+        gstreamer::init().expect("GStreamer init failed in test");
+        let pipeline = gstreamer::Pipeline::new();
+        let fakesink =
+            gstreamer::ElementFactory::make("fakesink").build().expect("Failed to create fakesink");
+        pipeline.add(&fakesink).unwrap();
+        Arc::new(Self {
+            pipeline,
+            encoder: fakesink,
+            bitrate: AtomicU32::new(6000),
+            running: AtomicBool::new(running),
+        })
+    }
+
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
         let _ = self.pipeline.set_state(gstreamer::State::Null);
@@ -126,7 +143,7 @@ pub fn start_pipeline(
     Ok((rx, controller))
 }
 
-fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {
+pub(crate) fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {
     let display = &config.display;
     let fps = config.fps;
     let bitrate = config.bitrate;
@@ -173,4 +190,131 @@ fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {
          ! video/x-h264,stream-format=byte-stream,alignment=au \
          ! appsink name=sink emit-signals=true sync=false"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> Config {
+        Config {
+            display: ":99".into(),
+            resolution: "1920x1080".into(),
+            listen: "0.0.0.0:4443".parse().unwrap(),
+            fps: 60,
+            bitrate: 6000,
+            keyframe_interval: 60,
+            cert: None,
+            key: None,
+            client_dir: "../client/dist/standalone".into(),
+            no_xvfb: false,
+            wm: "openbox".into(),
+            jwt_secret: None,
+            post_start_command: None,
+            stream_resolution: None,
+        }
+    }
+
+    #[test]
+    fn pipeline_string_no_scale_when_resolutions_match() {
+        let config = default_config();
+        let result = build_pipeline_string(&config, EncoderType::X264);
+        assert!(!result.contains("videoscale"));
+        assert!(result.contains("ximagesrc display-name=:99"));
+        assert!(result.contains("framerate=60/1"));
+        assert!(result.contains("x264enc name=encoder"));
+        assert!(result.contains("bitrate=6000"));
+        assert!(result.contains("key-int-max=60"));
+        assert!(result.contains("appsink name=sink"));
+    }
+
+    #[test]
+    fn pipeline_string_includes_scale_when_stream_resolution_differs() {
+        let mut config = default_config();
+        config.stream_resolution = Some("1280x720".into());
+        let result = build_pipeline_string(&config, EncoderType::X264);
+        assert!(result.contains("videoscale"));
+        assert!(result.contains("width=1280"));
+        assert!(result.contains("height=720"));
+    }
+
+    #[test]
+    fn pipeline_string_no_scale_when_stream_resolution_matches_desktop() {
+        let mut config = default_config();
+        config.stream_resolution = Some("1920x1080".into());
+        let result = build_pipeline_string(&config, EncoderType::X264);
+        assert!(!result.contains("videoscale"));
+    }
+
+    #[test]
+    fn pipeline_string_nvenc_encoder() {
+        let config = default_config();
+        let result = build_pipeline_string(&config, EncoderType::Nvenc);
+        assert!(result.contains("nvh264enc name=encoder"));
+        assert!(result.contains("preset=low-latency-hq"));
+        assert!(result.contains("rc-mode=cbr"));
+        assert!(result.contains("zerolatency=true"));
+        assert!(result.contains("gop-size=60"));
+        assert!(!result.contains("x264enc"));
+        assert!(!result.contains("vaapih264enc"));
+    }
+
+    #[test]
+    fn pipeline_string_vaapi_encoder() {
+        let config = default_config();
+        let result = build_pipeline_string(&config, EncoderType::Vaapi);
+        assert!(result.contains("vaapih264enc name=encoder"));
+        assert!(result.contains("rate-control=cbr"));
+        assert!(result.contains("keyframe-period=60"));
+        assert!(!result.contains("x264enc"));
+        assert!(!result.contains("nvh264enc"));
+    }
+
+    #[test]
+    fn pipeline_string_x264_includes_videoconvert() {
+        let config = default_config();
+        let result = build_pipeline_string(&config, EncoderType::X264);
+        assert!(result.contains("videoconvert"));
+        assert!(result.contains("video/x-raw,format=I420"));
+    }
+
+    #[test]
+    fn pipeline_string_custom_display_and_fps() {
+        let mut config = default_config();
+        config.display = ":42".into();
+        config.fps = 30;
+        config.bitrate = 3000;
+        config.keyframe_interval = 120;
+        let result = build_pipeline_string(&config, EncoderType::X264);
+        assert!(result.contains("display-name=:42"));
+        assert!(result.contains("framerate=30/1"));
+        assert!(result.contains("bitrate=3000"));
+        assert!(result.contains("key-int-max=120"));
+    }
+
+    #[test]
+    fn pipeline_string_stream_resolution_with_nvenc() {
+        let mut config = default_config();
+        config.stream_resolution = Some("640x480".into());
+        let result = build_pipeline_string(&config, EncoderType::Nvenc);
+        assert!(result.contains("videoscale"));
+        assert!(result.contains("width=640"));
+        assert!(result.contains("height=480"));
+        assert!(result.contains("nvh264enc name=encoder"));
+    }
+
+    #[test]
+    fn pipeline_string_always_has_byte_stream_format() {
+        for encoder in [EncoderType::X264, EncoderType::Nvenc, EncoderType::Vaapi] {
+            let result = build_pipeline_string(&default_config(), encoder);
+            assert!(
+                result.contains("stream-format=byte-stream"),
+                "Missing byte-stream for {encoder:?}"
+            );
+            assert!(
+                result.contains("alignment=au"),
+                "Missing alignment=au for {encoder:?}"
+            );
+        }
+    }
 }
