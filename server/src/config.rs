@@ -54,6 +54,16 @@ pub struct Config {
     /// JWT secret for session authentication (optional, disables auth if not set)
     #[arg(long)]
     pub jwt_secret: Option<String>,
+
+    /// Command to run after the display is ready (e.g. "xterm", "firefox")
+    #[arg(long, env = "PHANTOM_SCREEN_DESKTOP_COMMAND")]
+    pub post_start_command: Option<String>,
+
+    /// Encoded stream resolution, independent of the virtual desktop size (e.g. "1280x720").
+    /// Defaults to --resolution. Use this to capture at a high desktop resolution but stream
+    /// a lower resolution to clients.
+    #[arg(long)]
+    pub stream_resolution: Option<String>,
 }
 
 impl Config {
@@ -75,6 +85,26 @@ impl Config {
 
     pub fn display_num(&self) -> u32 {
         self.display.trim_start_matches(':').parse().unwrap_or(99)
+    }
+
+    pub fn stream_resolution_width(&self) -> u32 {
+        self.stream_resolution
+            .as_deref()
+            .unwrap_or(&self.resolution)
+            .split('x')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| self.resolution_width())
+    }
+
+    pub fn stream_resolution_height(&self) -> u32 {
+        self.stream_resolution
+            .as_deref()
+            .unwrap_or(&self.resolution)
+            .split('x')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| self.resolution_height())
     }
 }
 
@@ -123,6 +153,8 @@ mod tests {
             no_xvfb: false,
             wm: "openbox".into(),
             jwt_secret: None,
+            post_start_command: None,
+            stream_resolution: None,
         };
 
         assert_eq!(config.resolution_width(), 1920);
@@ -144,6 +176,8 @@ mod tests {
             no_xvfb: true,
             wm: "fluxbox".into(),
             jwt_secret: Some("secret".into()),
+            post_start_command: None,
+            stream_resolution: None,
         };
 
         assert_eq!(config.resolution_width(), 2560);
@@ -166,11 +200,41 @@ mod tests {
             no_xvfb: false,
             wm: "openbox".into(),
             jwt_secret: None,
+            post_start_command: None,
+            stream_resolution: None,
         };
 
         assert_eq!(config.resolution_width(), 1920); // fallback
         assert_eq!(config.resolution_height(), 1080); // fallback
         assert_eq!(config.display_num(), 99); // fallback
+    }
+
+    #[test]
+    fn test_stream_resolution() {
+        let mut config = Config {
+            display: ":99".into(),
+            resolution: "1920x1080".into(),
+            listen: "0.0.0.0:4443".parse().unwrap(),
+            fps: 60,
+            bitrate: 6000,
+            keyframe_interval: 60,
+            cert: None,
+            key: None,
+            client_dir: "../client/dist/standalone".into(),
+            no_xvfb: false,
+            wm: "openbox".into(),
+            jwt_secret: None,
+            post_start_command: None,
+            stream_resolution: None,
+        };
+        // Without stream_resolution, falls back to desktop resolution
+        assert_eq!(config.stream_resolution_width(), 1920);
+        assert_eq!(config.stream_resolution_height(), 1080);
+
+        // With stream_resolution set to a lower value
+        config.stream_resolution = Some("1280x720".into());
+        assert_eq!(config.stream_resolution_width(), 1280);
+        assert_eq!(config.stream_resolution_height(), 720);
     }
 
     #[test]
@@ -188,6 +252,8 @@ mod tests {
             no_xvfb: false,
             wm: "openbox".into(),
             jwt_secret: None,
+            post_start_command: None,
+            stream_resolution: None,
         };
         assert_eq!(config.display_num(), 42);
     }

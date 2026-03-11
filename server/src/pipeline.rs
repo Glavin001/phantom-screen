@@ -132,6 +132,17 @@ fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {
     let bitrate = config.bitrate;
     let ki = config.keyframe_interval;
 
+    // Insert a scale step if stream resolution differs from desktop resolution
+    let scale_part = {
+        let sw = config.stream_resolution_width();
+        let sh = config.stream_resolution_height();
+        if sw != config.resolution_width() || sh != config.resolution_height() {
+            format!("! videoscale ! video/x-raw,width={sw},height={sh} ")
+        } else {
+            String::new()
+        }
+    };
+
     let encoder_part = match encoder_type {
         EncoderType::X264 => {
             format!(
@@ -157,6 +168,7 @@ fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {
     format!(
         "ximagesrc display-name={display} use-damage=0 show-pointer=true \
          ! video/x-raw,framerate={fps}/1 \
+         {scale_part}\
          ! {encoder_part} \
          ! video/x-h264,stream-format=byte-stream,alignment=au \
          ! appsink name=sink emit-signals=true sync=false"

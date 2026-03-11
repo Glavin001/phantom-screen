@@ -22,8 +22,12 @@ openssl req \
 CERT_HASH_HEX="$(openssl x509 -in "$CERT_PATH" -outform DER | openssl dgst -sha256 -binary | od -An -vtx1 | tr -d ' \n')"
 CERT_HASH_BASE64="$(openssl x509 -in "$CERT_PATH" -outform DER | openssl dgst -sha256 -binary | openssl base64 -A)"
 
+# Write machine-readable hash file alongside the cert for automation
+printf '%s' "$CERT_HASH_HEX" > /certs/cert.sha256
+
 echo "Generated development certificate:"
-echo "  cert: $CERT_PATH"
-echo "  key:  $KEY_PATH"
+echo "  cert:            $CERT_PATH"
+echo "  key:             $KEY_PATH"
+echo "  sha256 file:     /certs/cert.sha256"
 echo "  sha256 (hex):    $CERT_HASH_HEX"
 echo "  sha256 (base64): $CERT_HASH_BASE64"

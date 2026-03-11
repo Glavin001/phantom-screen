@@ -224,6 +224,8 @@ OPTIONS:
   --no-xvfb                    Skip starting Xvfb
   --wm <COMMAND>               Window manager command [default: openbox]
   --jwt-secret <SECRET>        JWT secret for auth (env: PHANTOM_JWT_SECRET)
+  --post-start-command <CMD>   Command to run after display is ready (env: PHANTOM_SCREEN_DESKTOP_COMMAND)
+  --stream-resolution <WxH>    Encoded stream resolution, independent of desktop size (e.g. "1280x720")
 ```
 
 ## Browser support
