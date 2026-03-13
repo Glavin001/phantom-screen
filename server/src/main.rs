@@ -83,6 +83,20 @@ async fn main() -> Result<()> {
             .context("Failed to generate self-signed certificate")?
     };
 
+    // Compute certificate hash for client connection URL
+    let cert_hash_hex = {
+        let chain = identity.certificate_chain();
+        let certs = chain.as_slice();
+        if let Some(leaf) = certs.first() {
+            let digest = leaf.hash();
+            digest
+                .fmt(wtransport::tls::Sha256DigestFmt::DottedHex)
+                .replace(':', "")
+        } else {
+            String::new()
+        }
+    };
+
     let server_config = wtransport::ServerConfig::builder()
         .with_bind_address(config.listen)
         .with_identity(identity)
@@ -103,14 +117,17 @@ async fn main() -> Result<()> {
         }
     });
     info!("HTTP server on port {}", http_addr.port());
-    info!(
-        "Open https://127.0.0.1:{} in Chrome (WebTransport)",
-        config.listen.port()
-    );
-    info!(
-        "Open http://127.0.0.1:{} in browser (static files)",
-        http_addr.port()
-    );
+    if !cert_hash_hex.is_empty() {
+        info!("Certificate SHA-256: {}", cert_hash_hex);
+        info!(
+            "Connect at: http://127.0.0.1:{}/?serverUrl=https://127.0.0.1:{}&certHash={}&autoconnect=1",
+            http_addr.port(),
+            config.listen.port(),
+            cert_hash_hex
+        );
+    } else {
+        info!("Open http://127.0.0.1:{} in browser", http_addr.port());
+    }
 
     // Accept WebTransport sessions until a shutdown signal is received
     let shutdown = shutdown_signal();
