@@ -20,3 +20,5 @@ Thumbs.db
 
 # Local test assets
 .tmp/
+
+certs/

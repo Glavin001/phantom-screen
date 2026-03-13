@@ -33,8 +33,12 @@ CERT_HASH_BASE64="$(
     openssl base64 -A
 )"
 
+# Write machine-readable hash file alongside the cert for automation
+printf '%s' "$CERT_HASH_HEX" > "$OUT_DIR/cert.sha256"
+
 echo "Generated development certificate:"
-echo "  cert: $CERT_PATH"
-echo "  key:  $KEY_PATH"
+echo "  cert:            $CERT_PATH"
+echo "  key:             $KEY_PATH"
+echo "  sha256 file:     $OUT_DIR/cert.sha256"
 echo "  sha256 (hex):    $CERT_HASH_HEX"
 echo "  sha256 (base64): $CERT_HASH_BASE64"

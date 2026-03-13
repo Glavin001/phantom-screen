@@ -1,0 +1,28 @@
+services:
+  gen-cert:
+    image: alpine
+    profiles: [tools]
+    volumes:
+      - ./certs:/certs
+      - ./scripts/generate-dev-cert-docker.sh:/generate-dev-cert.sh:ro
+    entrypoint: /bin/sh
+    command: ["/generate-dev-cert.sh"]
+
+  phantom-screen:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "4443:4443/udp"
+      - "4443:4443/tcp"
+      - "4444:4444/tcp"
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      - RUST_LOG=phantom_screen_server=info
+    command:
+      - --display=:99
+      - --resolution=1920x1080
+      - --client-dir=/var/www/phantom-screen
+      - --cert=/certs/cert.pem
+      - --key=/certs/key.pem

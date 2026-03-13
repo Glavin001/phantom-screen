@@ -160,7 +160,7 @@ Client output directories:
 ### 1. Generate a dev cert and copy the printed SHA-256 hash
 
 ```bash
-bash scripts/generate-dev-cert.sh ./.tmp/dev-cert
+bash scripts/generate-dev-cert-linux.sh ./.tmp/dev-cert
 ```
 
 ### 2. Start the server with the generated cert
@@ -188,9 +188,22 @@ The packaged client defaults to software decoding (`prefer-software`) so it work
 
 ## Docker
 
+### docker compose (recommended)
+
+```bash
+docker compose run --rm gen-cert
+docker compose up --build
+```
+
+### Manual
+
 ```bash
 docker build -t phantom-screen -f server/Dockerfile .
-docker run -p 4443:4443/udp -p 4443:4443/tcp -p 4444:4444/tcp phantom-screen
+docker run \
+  -p 4443:4443/udp -p 4443:4443/tcp -p 4444:4444/tcp \
+  -v ./certs:/certs:ro \
+  phantom-screen \
+  --cert=/certs/cert.pem --key=/certs/key.pem
 ```
 
 ## Configuration
@@ -211,6 +224,8 @@ OPTIONS:
   --no-xvfb                    Skip starting Xvfb
   --wm <COMMAND>               Window manager command [default: openbox]
   --jwt-secret <SECRET>        JWT secret for auth (env: PHANTOM_JWT_SECRET)
+  --post-start-command <CMD>   Command to run after display is ready (env: PHANTOM_SCREEN_DESKTOP_COMMAND)
+  --stream-resolution <WxH>    Encoded stream resolution, independent of desktop size (e.g. "1280x720")
 ```
 
 ## Browser support

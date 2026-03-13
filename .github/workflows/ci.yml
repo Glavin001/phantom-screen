@@ -200,7 +200,7 @@ jobs:
         run: |
           VERSION="$(awk -F '"' '/^version = / { print $2; exit }' server/Cargo.toml)"
           mkdir -p dist/server
-          bash scripts/package-server-bundle.sh \
+          bash .github/scripts/package-server-bundle.sh \
             "${{ matrix.platform }}" \
             "$VERSION" \
             "server/target/release/phantom-screen-server" \

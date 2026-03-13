@@ -8,7 +8,7 @@ mod pipeline;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,16 +40,28 @@ async fn main() -> Result<()> {
         "Configuration"
     );
 
+    let mut children: Vec<Child> = Vec::new();
+
     // Start virtual display if needed
     if !config.no_xvfb {
-        start_xvfb(&config)?;
+        children.push(start_xvfb(&config)?);
     }
 
     // Start window manager
-    start_window_manager(&config)?;
+    children.push(start_window_manager(&config)?);
 
     // Wait for display to be ready
     tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Launch post-start command (e.g. a demo app) if configured
+    if let Some(ref cmd) = config.post_start_command {
+        info!("Launching post-start command: {}", cmd);
+        let child = Command::new("sh")
+            .args(["-c", cmd])
+            .spawn()
+            .context("Failed to start post-start command")?;
+        children.push(child);
+    }
 
     // Start GStreamer pipeline
     let (frame_rx, pipeline_controller) =
@@ -81,15 +93,16 @@ async fn main() -> Result<()> {
 
     info!("WebTransport server listening on {}", config.listen);
 
-    // Also start an HTTP server for serving static files
+    // Also start an HTTP server for serving static files and health checks
     let http_addr = SocketAddr::new(config.listen.ip(), config.listen.port() + 1);
     let client_dir = config.client_dir.clone();
+    let pc_for_http = pipeline_controller.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(http_addr, client_dir).await {
+        if let Err(e) = run_http_server(http_addr, client_dir, pc_for_http).await {
             error!("HTTP server error: {}", e);
         }
     });
-    info!("HTTP static file server on port {}", http_addr.port());
+    info!("HTTP server on port {}", http_addr.port());
     info!(
         "Open https://127.0.0.1:{} in Chrome (WebTransport)",
         config.listen.port()
@@ -99,61 +112,98 @@ async fn main() -> Result<()> {
         http_addr.port()
     );
 
-    // Accept WebTransport sessions
+    // Accept WebTransport sessions until a shutdown signal is received
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     loop {
-        let incoming = server.accept().await;
-        let session_request = match incoming.await {
-            Ok(req) => req,
-            Err(e) => {
-                warn!("Failed to accept incoming session: {}", e);
-                continue;
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("Shutdown signal received, cleaning up");
+                break;
             }
-        };
-
-        let path = session_request.path().to_string();
-        info!("WebTransport session request for path: {}", path);
-
-        // JWT authentication (if configured)
-        if let Some(ref secret) = config.jwt_secret {
-            match auth::extract_token_from_path(&path) {
-                Some(token) => match auth::validate_token(token, secret) {
-                    Ok(data) => {
-                        info!("Authenticated session for user: {}", data.claims.sub);
-                    }
+            incoming = server.accept() => {
+                let session_request = match incoming.await {
+                    Ok(req) => req,
                     Err(e) => {
-                        warn!("JWT validation failed: {}", e);
-                        // Reject by not accepting the session
+                        warn!("Failed to accept incoming session: {}", e);
                         continue;
                     }
-                },
-                None => {
-                    warn!("No JWT token in session path, rejecting");
-                    continue;
+                };
+
+                let path = session_request.path().to_string();
+                info!("WebTransport session request for path: {}", path);
+
+                // JWT authentication (if configured)
+                if let Some(ref secret) = config.jwt_secret {
+                    match auth::extract_token_from_path(&path) {
+                        Some(token) => match auth::validate_token(token, secret) {
+                            Ok(data) => {
+                                info!("Authenticated session for user: {}", data.claims.sub);
+                            }
+                            Err(e) => {
+                                warn!("JWT validation failed: {}", e);
+                                continue;
+                            }
+                        },
+                        None => {
+                            warn!("No JWT token in session path, rejecting");
+                            continue;
+                        }
+                    }
                 }
+
+                let session = match session_request.accept().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Failed to accept session request: {}", e);
+                        continue;
+                    }
+                };
+
+                let frame_rx = if pipeline_controller.is_running() {
+                    Some(frame_rx.resubscribe())
+                } else {
+                    None
+                };
+                let pc = pipeline_controller.clone();
+                let ih = input_handler.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = handle_session(session, frame_rx, pc, ih).await {
+                        warn!("Session ended: {}", e);
+                    }
+                });
             }
         }
+    }
 
-        let session = match session_request.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to accept session request: {}", e);
-                continue;
-            }
-        };
+    // Graceful shutdown: stop pipeline then kill all child processes
+    pipeline_controller.stop();
+    for child in &mut children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    info!("Shutdown complete");
 
-        let frame_rx = if pipeline_controller.is_running() {
-            Some(frame_rx.resubscribe())
-        } else {
-            None
-        };
-        let pc = pipeline_controller.clone();
-        let ih = input_handler.clone();
+    Ok(())
+}
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_session(session, frame_rx, pc, ih).await {
-                warn!("Session ended: {}", e);
-            }
-        });
+/// Resolves on SIGTERM or Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -267,8 +317,6 @@ fn process_input_data(
     }
 }
 
-// estimate_event_length moved to input.rs
-
 fn dispatch_event(
     event: &InputEvent,
     input_handler: &InputHandler,
@@ -291,39 +339,52 @@ fn dispatch_event(
     Ok(())
 }
 
-fn start_xvfb(config: &Config) -> Result<()> {
+/// Start Xvfb, removing any stale lock file first. Returns the child process handle.
+fn start_xvfb(config: &Config) -> Result<Child> {
     let disp = &config.display;
     let resolution = &config.resolution;
 
+    // Remove stale X lock file so a restart doesn't collide with the previous run
+    let lock_file = format!("/tmp/.X{}-lock", config.display_num());
+    if std::path::Path::new(&lock_file).exists() {
+        let _ = std::fs::remove_file(&lock_file);
+        info!("Removed stale X lock file: {}", lock_file);
+    }
+
     info!("Starting Xvfb on display {}", disp);
 
-    Command::new("Xvfb")
+    let child = Command::new("Xvfb")
         .args([disp, "-screen", "0", &format!("{}x24", resolution), "-ac"])
         .spawn()
         .context("Failed to start Xvfb")?;
 
-    // SAFETY: called during single-threaded init, before async runtime is fully running
+    // SAFETY: called during single-threaded init before any tasks are spawned
     unsafe { std::env::set_var("DISPLAY", disp) };
     std::thread::sleep(Duration::from_millis(300));
     info!("Xvfb started");
-    Ok(())
+    Ok(child)
 }
 
-fn start_window_manager(config: &Config) -> Result<()> {
+/// Start the window manager. Returns the child process handle.
+fn start_window_manager(config: &Config) -> Result<Child> {
     let wm = &config.wm;
     info!("Starting window manager: {}", wm);
 
-    Command::new(wm).spawn().context(format!(
+    let child = Command::new(wm).spawn().context(format!(
         "Failed to start window manager '{}'. Is it installed?",
         wm
     ))?;
 
     info!("Window manager started");
-    Ok(())
+    Ok(child)
 }
 
-/// Simple HTTP server for serving static files
-async fn run_http_server(addr: SocketAddr, client_dir: String) -> Result<()> {
+/// Simple HTTP server for serving static files and the /health endpoint
+async fn run_http_server(
+    addr: SocketAddr,
+    client_dir: String,
+    pipeline_controller: Arc<pipeline::PipelineController>,
+) -> Result<()> {
     use hyper::body::Incoming;
     use hyper::{Request, Response};
     use hyper_util::rt::TokioIo;
@@ -336,12 +397,29 @@ async fn run_http_server(addr: SocketAddr, client_dir: String) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let client_dir = client_dir.clone();
+        let pc = pipeline_controller.clone();
 
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let client_dir = client_dir.clone();
+                let pc = pc.clone();
                 async move {
                     let path = req.uri().path();
+
+                    // Health/readiness endpoint
+                    if path == "/health" {
+                        let status = if pc.is_running() { "ready" } else { "starting" };
+                        let body = format!(r#"{{"status":"{}"}}"#, status);
+                        return Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(200)
+                                .header("Content-Type", "application/json")
+                                .header("Access-Control-Allow-Origin", "*")
+                                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                .unwrap(),
+                        );
+                    }
+
                     let file_path = if path == "/" || path.is_empty() {
                         client_dir.join("index.html")
                     } else {
@@ -362,13 +440,11 @@ async fn run_http_server(addr: SocketAddr, client_dir: String) -> Result<()> {
                                 _ => "application/octet-stream",
                             };
 
-                            Ok::<_, Infallible>(
-                                Response::builder()
-                                    .header("Content-Type", content_type)
-                                    .header("Access-Control-Allow-Origin", "*")
-                                    .body(http_body_util::Full::new(bytes::Bytes::from(contents)))
-                                    .unwrap(),
-                            )
+                            Ok(Response::builder()
+                                .header("Content-Type", content_type)
+                                .header("Access-Control-Allow-Origin", "*")
+                                .body(http_body_util::Full::new(bytes::Bytes::from(contents)))
+                                .unwrap())
                         }
                         Err(_) => Ok(Response::builder()
                             .status(404)
