@@ -20,6 +20,7 @@ services:
       - ./certs:/certs:ro
     environment:
       - RUST_LOG=phantom_screen_server=info
+      - PHANTOM_SCREEN_DESKTOP_COMMAND=xterm
     command:
       - --display=:99
       - --resolution=1920x1080
