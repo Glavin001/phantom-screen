@@ -157,15 +157,71 @@ Client output directories:
 
 `WebTransport` does not trust self-signed certs just because the browser ignores normal HTTPS errors. Use certificate hashes instead, and make sure the development certificate is WebTransport-compatible (ECDSA P-256 and short-lived; Chrome rejects the old RSA/365-day profile during the QUIC handshake).
 
-### 1. Generate a dev cert and copy the printed SHA-256 hash
+### Docker (recommended — works on macOS, Linux, Windows)
+
+The server requires X11 + GStreamer, which Docker handles for you. The client runs in your local browser.
+
+#### 1. Generate a dev cert and save the printed SHA-256 hash
+
+```bash
+docker compose run --rm gen-cert
+```
+
+The hash is printed at the end — copy the `sha256 (hex)` or `sha256 (base64)` value. It is also saved to `certs/cert.sha256` for scripting.
+
+#### 2. Start the server
+
+```bash
+docker compose up --build
+```
+
+This builds the server binary and client bundle inside Docker and starts the server.
+The server exposes two ports on your host:
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 4443 | UDP+TCP | WebTransport (QUIC) endpoint |
+| 4444 | TCP | HTTP — serves the standalone client app |
+
+#### 3. Open the standalone client in Chrome
+
+Paste the cert hash from step 1 into the URL:
+
+```text
+http://127.0.0.1:4444/?serverUrl=https://127.0.0.1:4443&certHash=<hex-or-base64-hash>&autoconnect=1
+```
+
+Or open `http://127.0.0.1:4444` and enter the hash in the connection form.
+
+> **Tip:** To run a desktop app inside the virtual display, set the `PHANTOM_SCREEN_DESKTOP_COMMAND` environment variable in `docker-compose.yml`. For example, add `- PHANTOM_SCREEN_DESKTOP_COMMAND=xterm` under `environment:` to launch xterm on the virtual desktop.
+
+#### Docker manual run (without Compose)
+
+```bash
+docker build -t phantom-screen -f server/Dockerfile .
+docker run \
+  -p 4443:4443/udp -p 4443:4443/tcp -p 4444:4444/tcp \
+  -v ./certs:/certs:ro \
+  phantom-screen \
+  --cert=/certs/cert.pem --key=/certs/key.pem
+```
+
+### Native Linux (without Docker)
+
+If you are on Linux with X11 and GStreamer installed, you can run the server directly.
+
+#### 1. Generate a dev cert and copy the printed SHA-256 hash
 
 ```bash
 bash scripts/generate-dev-cert-linux.sh ./.tmp/dev-cert
 ```
 
-### 2. Start the server with the generated cert
+#### 2. Build and start the server
 
 ```bash
+cd client && npm install && npm run build && cd ..
+cd server && cargo build --release && cd ..
+
 ./server/target/release/phantom-screen-server \
   --display :99 \
   --resolution 1280x720 \
@@ -176,35 +232,13 @@ bash scripts/generate-dev-cert-linux.sh ./.tmp/dev-cert
   --key ./.tmp/dev-cert/key.pem
 ```
 
-### 3. Open the standalone client
-
-Use the printed hash either in the form input or directly in the URL:
+#### 3. Open the standalone client
 
 ```text
 http://127.0.0.1:4444/?serverUrl=https://127.0.0.1:4443&certHash=<hex-or-base64-hash>&autoconnect=1
 ```
 
 The packaged client defaults to software decoding (`prefer-software`) so it works on cloud VMs and other environments without GPU decode support.
-
-## Docker
-
-### docker compose (recommended)
-
-```bash
-docker compose run --rm gen-cert
-docker compose up --build
-```
-
-### Manual
-
-```bash
-docker build -t phantom-screen -f server/Dockerfile .
-docker run \
-  -p 4443:4443/udp -p 4443:4443/tcp -p 4444:4444/tcp \
-  -v ./certs:/certs:ro \
-  phantom-screen \
-  --cert=/certs/cert.pem --key=/certs/key.pem
-```
 
 ## Configuration
 
