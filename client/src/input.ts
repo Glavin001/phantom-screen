@@ -126,14 +126,25 @@ export function attachInputListeners(
     }
   }
 
+  function sendMousePosition(e: MouseEvent) {
+    const { scaleX, scaleY, offsetX, offsetY } = getScale();
+    const x = (e.clientX - offsetX) * scaleX;
+    const y = (e.clientY - offsetY) * scaleY;
+    if (x >= 0 && y >= 0) {
+      send(encodeMouseMove(x, y));
+    }
+  }
+
   function onMouseDown(e: MouseEvent) {
     e.preventDefault();
     canvas.focus();
+    sendMousePosition(e);
     send(encodeMouseButton(e.button, true));
   }
 
   function onMouseUp(e: MouseEvent) {
     e.preventDefault();
+    sendMousePosition(e);
     send(encodeMouseButton(e.button, false));
   }
 
