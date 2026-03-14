@@ -18,6 +18,7 @@ export interface UIElements {
   fullscreenBtn: HTMLButtonElement;
   pointerLockBtn: HTMLButtonElement;
   keyframeBtn: HTMLButtonElement;
+  coherenceBtn: HTMLButtonElement;
   statusBar: HTMLElement;
   toolbar: HTMLElement;
 }
@@ -47,6 +48,7 @@ export function getUIElements(root: ParentNode): UIElements {
     fullscreenBtn: query<HTMLButtonElement>(root, 'fullscreen-btn'),
     pointerLockBtn: query<HTMLButtonElement>(root, 'pointer-lock-btn'),
     keyframeBtn: query<HTMLButtonElement>(root, 'keyframe-btn'),
+    coherenceBtn: query<HTMLButtonElement>(root, 'coherence-btn'),
     statusBar: query<HTMLElement>(root, 'status-bar'),
     toolbar: query<HTMLElement>(root, 'toolbar'),
   };

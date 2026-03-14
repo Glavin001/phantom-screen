@@ -1,0 +1,7 @@
+.git
+server/target
+client/node_modules
+client/dist
+tests/fixtures/next-smoke/node_modules
+tests/fixtures/next-smoke/.next
+!proxy-ca.crt

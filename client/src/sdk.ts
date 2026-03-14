@@ -1,4 +1,5 @@
 import { ClipboardSync } from './clipboard';
+import { CoherenceController, type WindowInfo } from './coherence';
 import { ControlManager } from './control';
 import { createServerCertificateHashes, type ServerCertificateHash } from './hash';
 import { attachInputListeners, type InputSender } from './input';
@@ -47,6 +48,7 @@ export class PhantomScreenClient {
   private controlManager: ControlManager | null = null;
   private cleanupInput: CleanupFn | null = null;
   private clipboardSync = new ClipboardSync();
+  private coherenceController: CoherenceController | null = null;
 
   constructor(root: HTMLElement, options: PhantomScreenMountOptions = {}) {
     this.options = options;
@@ -72,6 +74,21 @@ export class PhantomScreenClient {
       setupPointerLock(this.ui),
       setupAutoHide(this.ui),
     ];
+
+    // Coherence mode toggle
+    const onCoherenceClick = () => {
+      if (this.isCoherenceActive()) {
+        this.disableCoherenceMode();
+        this.ui.coherenceBtn.textContent = 'Coherence';
+      } else {
+        this.enableCoherenceMode();
+        this.ui.coherenceBtn.textContent = 'Desktop';
+      }
+    };
+    this.ui.coherenceBtn.addEventListener('click', onCoherenceClick);
+    this.cleanupUi.push(() => {
+      this.ui.coherenceBtn.removeEventListener('click', onCoherenceClick);
+    });
 
     const onConnectClick = () => {
       void this.connect();
@@ -157,6 +174,18 @@ export class PhantomScreenClient {
       };
 
       this.controlManager = new ControlManager(send, this.ui);
+      this.coherenceController = new CoherenceController(send, {
+        onWindowListChanged: (windows) => {
+          this.updateCoherenceUI(windows);
+        },
+      }, this.options.decoderHardwareAcceleration ?? 'prefer-software');
+
+      // Set inline parent for coherence window streams
+      const inlineStreams = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="inline-streams"]');
+      if (inlineStreams) {
+        this.coherenceController.setInlineParent(inlineStreams);
+      }
+
       this.setupDecoder();
 
       this.cleanupInput = attachInputListeners(
@@ -173,15 +202,51 @@ export class PhantomScreenClient {
 
       void this.readVideoStreams(currentTransport);
       void this.readInputResponses(biStream.readable.getReader());
+      void this.loadLaunchApps(serverUrl);
     } catch (error) {
       this.disconnect(false);
       this.updateState('error', `Failed to connect: ${toErrorMessage(error)}`);
     }
   }
 
+  /** Enable coherence mode — each X11 window becomes a separate browser popup */
+  enableCoherenceMode(): void {
+    this.coherenceController?.enableCoherenceMode();
+    // Hide the main canvas and show the coherence panel
+    this.ui.canvas.style.display = 'none';
+    const panel = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="coherence-panel"]');
+    if (panel) panel.style.display = 'block';
+  }
+
+  /** Disable coherence mode — return to full-desktop streaming */
+  disableCoherenceMode(): void {
+    this.coherenceController?.disableCoherenceMode();
+    this.ui.canvas.style.display = '';
+    const panel = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="coherence-panel"]');
+    if (panel) panel.style.display = 'none';
+  }
+
+  /** Open a popup for a specific window */
+  openWindowPopup(windowId: number): void {
+    this.coherenceController?.openWindowPopup(windowId);
+  }
+
+  /** Launch an app on the remote desktop */
+  launchApp(command: string): void {
+    this.coherenceController?.launchApp(command);
+  }
+
+  /** Check if coherence mode is active */
+  isCoherenceActive(): boolean {
+    return this.coherenceController?.isActive() ?? false;
+  }
+
   disconnect(updateState = true): void {
     this.cleanupInput?.();
     this.cleanupInput = null;
+
+    this.coherenceController?.destroy();
+    this.coherenceController = null;
 
     this.controlManager?.destroy();
     this.controlManager = null;
@@ -361,10 +426,7 @@ export class PhantomScreenClient {
       reader.releaseLock();
     }
 
-    if (totalLength < 13) {
-      return;
-    }
-
+    // Assemble all chunks into a single buffer
     const data = new Uint8Array(totalLength);
     let offset = 0;
     for (const chunk of chunks) {
@@ -372,9 +434,49 @@ export class PhantomScreenClient {
       offset += chunk.length;
     }
 
+    // Check for window events FIRST — they can be shorter than 13 bytes
+    // (e.g., Removed = 6 bytes, VisibilityChanged = 7 bytes)
+    if (data.length >= 2 && data[0] === 0x40) {
+      this.coherenceController?.handleWindowEventData(data);
+      return;
+    }
+
+    if (totalLength < 13) {
+      return;
+    }
+
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const flags = data[0];
     const isKeyframe = (flags & 0x01) !== 0;
+    const isWindowFrame = (flags & 0x02) !== 0;
+
+    if (isWindowFrame) {
+      // Per-window coherence frame: [flags:u8][window_id:u32][pts:u64][len:u32][data]
+      if (data.length < 17) {
+        console.warn('[sdk] Window frame too short:', data.length);
+        return;
+      }
+      const windowId = view.getUint32(1, false);
+      const ptsHigh = view.getUint32(5, false);
+      const ptsLow = view.getUint32(9, false);
+      const pts = ptsHigh * 0x100000000 + ptsLow;
+      const payloadLength = view.getUint32(13, false);
+
+      if (data.length < 17 + payloadLength) {
+        console.warn('[sdk] Window frame payload truncated:', data.length, 'expected', 17 + payloadLength);
+        return;
+      }
+
+      this.coherenceController?.routeVideoFrame(
+        windowId,
+        data.slice(17, 17 + payloadLength),
+        isKeyframe,
+        pts,
+      );
+      return;
+    }
+
+    // Regular full-desktop frame: [flags:u8][pts:u64][len:u32][data]
     const ptsHigh = view.getUint32(1, false);
     const ptsLow = view.getUint32(5, false);
     const pts = ptsHigh * 0x100000000 + ptsLow;
@@ -403,6 +505,62 @@ export class PhantomScreenClient {
       this.decoder.decode(chunk);
     } catch {
       this.resetDecoder();
+    }
+  }
+
+  private async loadLaunchApps(serverUrl: string): Promise<void> {
+    try {
+      // Derive the HTTP URL from the WebTransport URL (port + 1)
+      const url = new URL(serverUrl);
+      const port = parseInt(url.port || '4443', 10) + 1;
+      const httpUrl = `http://${url.hostname}:${port}/api/launch-apps`;
+      const resp = await fetch(httpUrl);
+      if (!resp.ok) return;
+      const apps: string[] = await resp.json();
+
+      const grid = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="launch-grid"]');
+      if (!grid) return;
+
+      grid.innerHTML = '';
+      for (const app of apps) {
+        const btn = document.createElement('button');
+        btn.className = 'phantom-screen-launch-btn';
+        btn.textContent = app;
+        btn.addEventListener('click', () => {
+          this.launchApp(app);
+        });
+        grid.appendChild(btn);
+      }
+    } catch {
+      // Non-critical — launch apps just won't be populated
+    }
+  }
+
+  private updateCoherenceUI(windows: WindowInfo[]): void {
+    const list = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="window-list"]');
+    if (!list) return;
+
+    list.innerHTML = '';
+    for (const win of windows) {
+      if (!win.visible) continue;
+      const item = document.createElement('div');
+      item.className = 'phantom-screen-window-item';
+      const title = (win.title || win.appClass || 'Window').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      item.innerHTML = `
+        <span class="phantom-screen-window-title">${title} [${win.windowId}]</span>
+        <span class="phantom-screen-window-size">${win.width}x${win.height}</span>
+        <button class="phantom-screen-toolbar-btn phantom-screen-window-open-btn" data-window-id="${win.windowId}">Open</button>
+        <button class="phantom-screen-toolbar-btn phantom-screen-window-popout-btn" data-window-id="${win.windowId}">Pop Out</button>
+      `;
+      const openBtn = item.querySelector('.phantom-screen-window-open-btn');
+      openBtn?.addEventListener('click', () => {
+        this.coherenceController?.openWindowPopup(win.windowId);
+      });
+      const popoutBtn = item.querySelector('.phantom-screen-window-popout-btn');
+      popoutBtn?.addEventListener('click', () => {
+        this.coherenceController?.openWindowAsPopup(win.windowId);
+      });
+      list.appendChild(item);
     }
   }
 

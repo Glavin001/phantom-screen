@@ -229,6 +229,156 @@ const styles = `
     font-size: 13px;
   }
 
+  /* Coherence mode styles */
+  .phantom-screen-coherence-panel {
+    display: none;
+    position: absolute;
+    inset: 40px 0 60px 0;
+    overflow-y: auto;
+    padding: 16px 24px;
+    background: rgba(15, 15, 35, 0.96);
+    color: #e0e0e0;
+  }
+
+  .phantom-screen-coherence-panel h2 {
+    margin: 0 0 12px;
+    font-size: 18px;
+    font-weight: 400;
+  }
+
+  .phantom-screen-coherence-section {
+    margin-bottom: 20px;
+  }
+
+  .phantom-screen-coherence-section h3 {
+    margin: 0 0 8px;
+    font-size: 14px;
+    font-weight: 500;
+    color: #aaa;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .phantom-screen-launch-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .phantom-screen-launch-btn {
+    background: rgba(74, 108, 247, 0.2);
+    border: 1px solid rgba(74, 108, 247, 0.4);
+    color: #8ab4f8;
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    transition: background 0.2s;
+  }
+
+  .phantom-screen-launch-btn:hover {
+    background: rgba(74, 108, 247, 0.4);
+  }
+
+  .phantom-screen-window-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .phantom-screen-window-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 12px;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 6px;
+    font-size: 13px;
+  }
+
+  .phantom-screen-window-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .phantom-screen-window-size {
+    color: #888;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+  }
+
+  .phantom-screen-window-open-btn {
+    padding: 4px 10px !important;
+    font-size: 11px !important;
+  }
+
+  .phantom-screen-coherence-empty {
+    color: #666;
+    font-style: italic;
+    font-size: 13px;
+  }
+
+  /* Inline window stream rendering */
+  .phantom-screen-inline-streams {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 16px;
+  }
+
+  .phantom-screen-inline-window {
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #000;
+    max-width: 100%;
+  }
+
+  .phantom-screen-inline-titlebar {
+    display: flex;
+    align-items: center;
+    padding: 4px 8px;
+    background: rgba(255, 255, 255, 0.08);
+    font-size: 12px;
+    color: #ccc;
+  }
+
+  .phantom-screen-inline-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .phantom-screen-inline-close {
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 18px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+  }
+
+  .phantom-screen-inline-close:hover {
+    color: #f44;
+  }
+
+  .phantom-screen-inline-canvas {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    cursor: default;
+    outline: none;
+  }
+
+  .phantom-screen-inline-canvas:focus {
+    box-shadow: 0 0 0 2px rgba(74, 108, 247, 0.6);
+  }
+
   .phantom-screen-stats {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 11px;
@@ -304,6 +454,24 @@ export function renderTemplate(root: ShadowRoot | HTMLElement, options: Template
         <canvas class="phantom-screen-canvas" data-phantom-screen="desktop-canvas" tabindex="0"></canvas>
       </div>
 
+      <div class="phantom-screen-coherence-panel" data-phantom-screen="coherence-panel">
+        <h2>Coherence Mode</h2>
+        <div class="phantom-screen-coherence-section">
+          <h3>Quick Launch</h3>
+          <div class="phantom-screen-launch-grid" data-phantom-screen="launch-grid"></div>
+        </div>
+        <div class="phantom-screen-coherence-section">
+          <h3>Windows</h3>
+          <div class="phantom-screen-window-list" data-phantom-screen="window-list">
+            <div class="phantom-screen-coherence-empty">No windows detected yet</div>
+          </div>
+        </div>
+        <div class="phantom-screen-coherence-section">
+          <h3>Streams</h3>
+          <div class="phantom-screen-inline-streams" data-phantom-screen="inline-streams"></div>
+        </div>
+      </div>
+
       <div class="phantom-screen-status-bar" data-phantom-screen="status-bar">
         <div class="phantom-screen-status-item">
           <div class="phantom-screen-status-dot" data-phantom-screen="status-dot"></div>
@@ -317,6 +485,9 @@ export function renderTemplate(root: ShadowRoot | HTMLElement, options: Template
       </div>
 
       <div class="phantom-screen-toolbar" data-phantom-screen="toolbar">
+        <button class="phantom-screen-toolbar-btn" data-phantom-screen="coherence-btn" title="Toggle coherence mode (per-window streaming)">
+          Coherence
+        </button>
         <button class="phantom-screen-toolbar-btn" data-phantom-screen="fullscreen-btn" title="Toggle fullscreen">
           Fullscreen
         </button>

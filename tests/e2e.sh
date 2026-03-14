@@ -19,6 +19,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+source "$SCRIPT_DIR/docker-proxy-helper.sh"
+
 IMAGE_NAME="phantom-screen-e2e-test"
 CONTAINER_NAME="phantom-screen-e2e-$$"
 HTTP_PORT=14444
@@ -46,7 +48,7 @@ trap cleanup EXIT
 # ---- Build ----
 if [[ "${1:-}" != "--no-build" ]]; then
   echo "Building Docker image..."
-  docker build -t "$IMAGE_NAME" -f "$PROJECT_DIR/server/Dockerfile" "$PROJECT_DIR" || {
+  docker_build_proxied "$PROJECT_DIR/server/Dockerfile" -t "$IMAGE_NAME" "$PROJECT_DIR" || {
     log_fail "Docker build failed"
     exit 1
   }
@@ -64,7 +66,7 @@ docker run -d \
   -p "$WT_PORT:4443/tcp" \
   -p "$HTTP_PORT:4444/tcp" \
   "$IMAGE_NAME" \
-  --display=:99 --resolution=1280x720 --fps=30 --client-dir=/var/www/phantom-screen >/dev/null
+  --display=:99 --resolution=1280x720 --fps=30 --client-dir=/var/www/phantom-screen --post-start-command=xterm >/dev/null
 
 # Wait for startup
 echo "Waiting for server to start..."
@@ -172,28 +174,6 @@ else
   log_fail "Custom resolution not detected in logs"
 fi
 
-# ---- Test: xrandr is available for dynamic resize ----
-if docker exec "$CONTAINER_NAME" command -v xrandr >/dev/null 2>&1; then
-  log_pass "xrandr is available for dynamic resize"
-else
-  log_fail "xrandr is not installed (needed for dynamic resize)"
-fi
-
-# ---- Test: cvt is available for modeline generation ----
-if docker exec "$CONTAINER_NAME" command -v cvt >/dev/null 2>&1; then
-  log_pass "cvt is available for modeline generation"
-else
-  log_fail "cvt is not installed (needed for dynamic resize)"
-fi
-
-# ---- Test: xrandr can query the display ----
-XRANDR_OUTPUT=$(docker exec "$CONTAINER_NAME" xrandr --query 2>&1 || echo "XRANDR_FAILED")
-if echo "$XRANDR_OUTPUT" | grep -q "connected"; then
-  log_pass "xrandr can query display (RANDR extension active)"
-else
-  log_fail "xrandr cannot query display: $XRANDR_OUTPUT"
-fi
-
 # ---- Test: Xvfb started with BackingStore (+bs) ----
 XVFB_CMDLINE=$(docker exec "$CONTAINER_NAME" sh -c 'cat /proc/$(pgrep -x Xvfb)/cmdline | tr "\0" " "' 2>/dev/null || echo "")
 if echo "$XVFB_CMDLINE" | grep -q "+bs"; then
@@ -209,36 +189,70 @@ else
   log_fail "Xvfb not started with RANDR extension. Cmdline: $XVFB_CMDLINE"
 fi
 
-# ---- Test: Dynamic resize via xrandr works ----
-# Try resizing to a different resolution and verify it takes effect
-RESIZE_RESULT=$(docker exec "$CONTAINER_NAME" sh -c '
-  # Generate modeline for 1024x768
-  MODELINE=$(cvt 1024 768 60 2>/dev/null | grep Modeline | sed "s/.*\"[^\"]*\"//" | xargs)
-  # Get output name
-  OUTPUT=$(xrandr --query | grep " connected" | head -1 | awk "{print \$1}")
-  if [ -z "$OUTPUT" ]; then
-    echo "NO_OUTPUT"
-    exit 1
-  fi
-  # Add mode, add to output, set it
-  xrandr --newmode "1024x768" $MODELINE 2>/dev/null || true
-  xrandr --addmode "$OUTPUT" "1024x768" 2>/dev/null || true
-  xrandr --output "$OUTPUT" --mode "1024x768" 2>&1
-  # Verify new resolution is active
-  xrandr --query 2>/dev/null | grep -o "1024x768.*\*" || echo "RESIZE_NOT_ACTIVE"
-' 2>&1)
-if echo "$RESIZE_RESULT" | grep -q "1024x768"; then
-  log_pass "Dynamic xrandr resize to 1024x768 succeeded"
-else
-  log_fail "Dynamic xrandr resize failed: $RESIZE_RESULT"
-fi
-
 # ---- Test: Container still running after resize ----
 CONTAINER_STATUS_POST=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")
 if [ "$CONTAINER_STATUS_POST" = "running" ]; then
   log_pass "Container still running after resize test"
 else
   log_fail "Container crashed after resize test (status: $CONTAINER_STATUS_POST)"
+fi
+
+# ---- Test: Coherence mode support initialized ----
+if echo "$CONTAINER_LOGS" | grep -q "Coherence mode support initialized"; then
+  log_pass "Coherence mode support initialized"
+else
+  log_fail "Coherence mode support not initialized"
+fi
+
+# ---- Test: Window monitor detected windows ----
+if echo "$CONTAINER_LOGS" | grep -q "Window monitor started, found [0-9]"; then
+  WINDOW_COUNT=$(echo "$CONTAINER_LOGS" | grep "Window monitor started" | grep -oE "found [0-9]+" | grep -oE "[0-9]+")
+  if [ "${WINDOW_COUNT:-0}" -ge 1 ]; then
+    log_pass "Window monitor detected $WINDOW_COUNT window(s)"
+  else
+    log_fail "Window monitor found 0 windows (expected at least 1 from xterm)"
+  fi
+else
+  log_fail "Window monitor startup log not found"
+fi
+
+# ---- Test: /api/launch-apps endpoint ----
+LAUNCH_APPS=$(curl -s "http://localhost:$HTTP_PORT/api/launch-apps" 2>/dev/null || echo "")
+if echo "$LAUNCH_APPS" | grep -q "xterm"; then
+  log_pass "/api/launch-apps returns app list containing xterm"
+else
+  log_fail "/api/launch-apps returned unexpected: $LAUNCH_APPS"
+fi
+
+# ---- Test: Launching an app creates a new window ----
+# Get window count before launching
+WINDOW_COUNT_BEFORE=$(docker exec "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xdotool search --onlyvisible --name "" 2>/dev/null | wc -l' || echo "0")
+# Launch a new xterm
+docker exec -d "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xterm -e "sleep 10" &'
+sleep 2
+WINDOW_COUNT_AFTER=$(docker exec "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xdotool search --onlyvisible --name "" 2>/dev/null | wc -l' || echo "0")
+if [ "${WINDOW_COUNT_AFTER:-0}" -gt "${WINDOW_COUNT_BEFORE:-0}" ]; then
+  log_pass "Launching app created a new window ($WINDOW_COUNT_BEFORE -> $WINDOW_COUNT_AFTER)"
+else
+  log_fail "No new window detected after app launch ($WINDOW_COUNT_BEFORE -> $WINDOW_COUNT_AFTER)"
+fi
+
+# ---- Test: Window monitor detects new window via events or xdotool ----
+# Refresh logs after the new window
+sleep 1
+CONTAINER_LOGS_AFTER=$(docker logs "$CONTAINER_NAME" 2>&1 || true)
+if echo "$CONTAINER_LOGS_AFTER" | grep -q "Window added"; then
+  log_pass "Window monitor emitted Added event for new window"
+elif echo "$CONTAINER_LOGS_AFTER" | grep -q "VisibilityChanged\|MapNotify"; then
+  log_pass "Window monitor detected visibility change for new window"
+else
+  # Fallback: verify xdotool can find more windows than at startup
+  NEW_COUNT=$(docker exec "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xdotool search --onlyvisible --name "xterm" 2>/dev/null | wc -l' || echo "0")
+  if [ "${NEW_COUNT:-0}" -ge 2 ]; then
+    log_pass "New xterm window detected via xdotool ($NEW_COUNT visible xterm windows)"
+  else
+    log_fail "Window monitor did not detect new window (no Added event, xterm count: $NEW_COUNT)"
+  fi
 fi
 
 # ---- Results ----

@@ -64,6 +64,18 @@ pub struct Config {
     /// a lower resolution to clients.
     #[arg(long)]
     pub stream_resolution: Option<String>,
+
+    /// Applications available for quick launch in coherence mode (comma-separated)
+    #[arg(long, default_value = "xterm,firefox")]
+    pub launch_apps: String,
+
+    /// Per-window encoder bitrate in kbps for coherence mode
+    #[arg(long, default_value_t = 2000)]
+    pub window_bitrate: u32,
+
+    /// Maximum concurrent per-window pipelines in coherence mode
+    #[arg(long, default_value_t = 8)]
+    pub max_window_pipelines: u32,
 }
 
 impl Config {
@@ -95,6 +107,15 @@ impl Config {
             .next()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| self.resolution_width())
+    }
+
+    /// Parse launch_apps as a list of app commands.
+    pub fn launch_app_list(&self) -> Vec<String> {
+        self.launch_apps
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     pub fn stream_resolution_height(&self) -> u32 {
@@ -155,6 +176,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            launch_apps: "xterm,firefox".into(),
+            window_bitrate: 2000,
+            max_window_pipelines: 8,
         };
 
         assert_eq!(config.resolution_width(), 1920);
@@ -178,6 +202,9 @@ mod tests {
             jwt_secret: Some("secret".into()),
             post_start_command: None,
             stream_resolution: None,
+            launch_apps: "xterm,firefox".into(),
+            window_bitrate: 2000,
+            max_window_pipelines: 8,
         };
 
         assert_eq!(config.resolution_width(), 2560);
@@ -202,6 +229,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            launch_apps: "xterm,firefox".into(),
+            window_bitrate: 2000,
+            max_window_pipelines: 8,
         };
 
         assert_eq!(config.resolution_width(), 1920); // fallback
@@ -226,6 +256,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            launch_apps: "xterm,firefox".into(),
+            window_bitrate: 2000,
+            max_window_pipelines: 8,
         };
         // Without stream_resolution, falls back to desktop resolution
         assert_eq!(config.stream_resolution_width(), 1920);
@@ -254,6 +287,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            launch_apps: "xterm,firefox".into(),
+            window_bitrate: 2000,
+            max_window_pipelines: 8,
         };
         assert_eq!(config.display_num(), 42);
     }
