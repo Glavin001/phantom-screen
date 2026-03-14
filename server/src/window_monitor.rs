@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::broadcast;
 use x11rb::connection::Connection;
+use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
 
@@ -217,6 +218,13 @@ fn run_monitor_loop(
         .context("Failed to connect to X11 for monitoring")?;
     let root = conn.setup().roots[screen_num].root;
     let atoms = Atoms::intern(&conn)?;
+
+    // Enable X Composite extension: redirect all child windows to offscreen pixmaps
+    // so ximagesrc can capture each window independently even when overlapped.
+    composite::redirect_subwindows(&conn, root, composite::Redirect::AUTOMATIC)?
+        .check()
+        .context("Failed to enable Composite redirection on root window")?;
+    tracing::info!("X Composite: redirected subwindows for independent capture");
 
     // Subscribe to substructure notify on root (window create/destroy/reparent/configure)
     conn.change_window_attributes(

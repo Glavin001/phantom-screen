@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11-xserver-utils \
     xdotool \
     xclip \
+    libxcomposite1 \
     ca-certificates \
     fonts-liberation \
     xterm \
@@ -32,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-dev \
     libxcb1-dev \
     libxcb-xtest0-dev \
+    libxcomposite-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build

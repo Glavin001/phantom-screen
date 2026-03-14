@@ -772,6 +772,8 @@ fn start_xvfb(config: &Config) -> Result<Child> {
             "+bs", // Enable BackingStore so obscured windows retain their pixels
             "+extension",
             "RANDR", // Enable RandR for dynamic resolution changes
+            "+extension",
+            "Composite", // Enable Composite so per-window capture gets full contents
         ])
         .spawn()
         .context("Failed to start Xvfb")?;

@@ -349,6 +349,8 @@ pub fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
             "+bs",
             "+extension",
             "RANDR",
+            "+extension",
+            "Composite",
         ])
         .spawn()
         .context("Failed to start new Xvfb")?;
