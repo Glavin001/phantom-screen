@@ -193,7 +193,7 @@ http://127.0.0.1:4444/?serverUrl=https://127.0.0.1:4443&certHash=<hex-or-base64-
 
 Or open `http://127.0.0.1:4444` and enter the hash in the connection form.
 
-> **Tip:** To run a desktop app inside the virtual display, set the `PHANTOM_SCREEN_DESKTOP_COMMAND` environment variable in `docker-compose.yml`. For example, add `- PHANTOM_SCREEN_DESKTOP_COMMAND=xterm` under `environment:` to launch xterm on the virtual desktop.
+> **Tip:** The Docker image includes pre-installed apps for testing: **xterm**, **Firefox** (`firefox`), **Chromium** (`chromium --no-sandbox --disable-gpu`), and **L3afpad** (`l3afpad`, lightweight text editor). Set `PHANTOM_SCREEN_DESKTOP_COMMAND` in `docker-compose.yml` to launch one on the virtual desktop; use the full Chromium flags when running in Docker.
 
 #### Docker manual run (without Compose)
 

@@ -619,7 +619,7 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
-            launch_apps: "xterm,firefox".into(),
+            launch_apps: "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad".into(),
             window_bitrate: 2000,
             max_window_pipelines: 8,
         }

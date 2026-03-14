@@ -55,7 +55,7 @@ pub struct Config {
     #[arg(long)]
     pub jwt_secret: Option<String>,
 
-    /// Command to run after the display is ready (e.g. "xterm", "firefox")
+    /// Command to run after the display is ready (e.g. "xterm", "firefox", "chromium", "l3afpad")
     #[arg(long, env = "PHANTOM_SCREEN_DESKTOP_COMMAND")]
     pub post_start_command: Option<String>,
 
@@ -66,7 +66,7 @@ pub struct Config {
     pub stream_resolution: Option<String>,
 
     /// Applications available for quick launch in coherence mode (comma-separated)
-    #[arg(long, default_value = "xterm,firefox")]
+    #[arg(long, default_value = "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad")]
     pub launch_apps: String,
 
     /// Per-window encoder bitrate in kbps for coherence mode
@@ -176,7 +176,7 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
-            launch_apps: "xterm,firefox".into(),
+            launch_apps: "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad".into(),
             window_bitrate: 2000,
             max_window_pipelines: 8,
         };
@@ -202,7 +202,7 @@ mod tests {
             jwt_secret: Some("secret".into()),
             post_start_command: None,
             stream_resolution: None,
-            launch_apps: "xterm,firefox".into(),
+            launch_apps: "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad".into(),
             window_bitrate: 2000,
             max_window_pipelines: 8,
         };
@@ -229,7 +229,7 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
-            launch_apps: "xterm,firefox".into(),
+            launch_apps: "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad".into(),
             window_bitrate: 2000,
             max_window_pipelines: 8,
         };
@@ -256,7 +256,7 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
-            launch_apps: "xterm,firefox".into(),
+            launch_apps: "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad".into(),
             window_bitrate: 2000,
             max_window_pipelines: 8,
         };
@@ -287,7 +287,7 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
-            launch_apps: "xterm,firefox".into(),
+            launch_apps: "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad".into(),
             window_bitrate: 2000,
             max_window_pipelines: 8,
         };
