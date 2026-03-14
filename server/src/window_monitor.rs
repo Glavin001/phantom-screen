@@ -255,14 +255,14 @@ fn run_monitor_loop(
                 let win = e.window;
                 if tracked.contains_key(&win) {
                     // Window became visible
-                    if let Some(info) = tracked.get_mut(&win) {
-                        if !info.visible {
-                            info.visible = true;
-                            let _ = tx.send(WindowEvent::VisibilityChanged {
-                                window_id: win,
-                                visible: true,
-                            });
-                        }
+                    if let Some(info) = tracked.get_mut(&win)
+                        && !info.visible
+                    {
+                        info.visible = true;
+                        let _ = tx.send(WindowEvent::VisibilityChanged {
+                            window_id: win,
+                            visible: true,
+                        });
                     }
                 } else {
                     // New window mapped - check if it's one we should track
@@ -281,29 +281,29 @@ fn run_monitor_loop(
                     } else {
                         // This might be a WM frame window — check its children
                         // (window managers reparent client windows under frame windows)
-                        if let Ok(subtree) = conn.query_tree(win) {
-                            if let Ok(subtree) = subtree.reply() {
-                                for &child in &subtree.children {
-                                    if tracked.contains_key(&child) {
-                                        continue;
-                                    }
-                                    if let Some(info) = query_window_info(&conn, child, &atoms) {
-                                        tracing::info!(
-                                            "Window added (via WM frame): {} ({})",
-                                            info.title,
-                                            child
-                                        );
-                                        let _ = tx.send(WindowEvent::Added(info.clone()));
-                                        let _ = conn.change_window_attributes(
-                                            child,
-                                            &xproto::ChangeWindowAttributesAux::new().event_mask(
-                                                xproto::EventMask::PROPERTY_CHANGE
-                                                    | xproto::EventMask::STRUCTURE_NOTIFY,
-                                            ),
-                                        );
-                                        let _ = conn.flush();
-                                        tracked.insert(child, info);
-                                    }
+                        if let Ok(subtree) = conn.query_tree(win)
+                            && let Ok(subtree) = subtree.reply()
+                        {
+                            for &child in &subtree.children {
+                                if tracked.contains_key(&child) {
+                                    continue;
+                                }
+                                if let Some(info) = query_window_info(&conn, child, &atoms) {
+                                    tracing::info!(
+                                        "Window added (via WM frame): {} ({})",
+                                        info.title,
+                                        child
+                                    );
+                                    let _ = tx.send(WindowEvent::Added(info.clone()));
+                                    let _ = conn.change_window_attributes(
+                                        child,
+                                        &xproto::ChangeWindowAttributesAux::new().event_mask(
+                                            xproto::EventMask::PROPERTY_CHANGE
+                                                | xproto::EventMask::STRUCTURE_NOTIFY,
+                                        ),
+                                    );
+                                    let _ = conn.flush();
+                                    tracked.insert(child, info);
                                 }
                             }
                         }
@@ -313,14 +313,14 @@ fn run_monitor_loop(
 
             x11rb::protocol::Event::UnmapNotify(e) => {
                 let win = e.window;
-                if let Some(info) = tracked.get_mut(&win) {
-                    if info.visible {
-                        info.visible = false;
-                        let _ = tx.send(WindowEvent::VisibilityChanged {
-                            window_id: win,
-                            visible: false,
-                        });
-                    }
+                if let Some(info) = tracked.get_mut(&win)
+                    && info.visible
+                {
+                    info.visible = false;
+                    let _ = tx.send(WindowEvent::VisibilityChanged {
+                        window_id: win,
+                        visible: false,
+                    });
                 }
             }
 
@@ -364,16 +364,16 @@ fn run_monitor_loop(
                 if win == root {
                     continue;
                 }
-                if e.atom == atoms.net_wm_name || e.atom == atoms.wm_name {
-                    if let Some(info) = tracked.get_mut(&win) {
-                        let new_title = get_window_title(&conn, win, &atoms);
-                        if new_title != info.title {
-                            info.title = new_title.clone();
-                            let _ = tx.send(WindowEvent::TitleChanged {
-                                window_id: win,
-                                title: new_title,
-                            });
-                        }
+                if (e.atom == atoms.net_wm_name || e.atom == atoms.wm_name)
+                    && let Some(info) = tracked.get_mut(&win)
+                {
+                    let new_title = get_window_title(&conn, win, &atoms);
+                    if new_title != info.title {
+                        info.title = new_title.clone();
+                        let _ = tx.send(WindowEvent::TitleChanged {
+                            window_id: win,
+                            title: new_title,
+                        });
                     }
                 }
             }
@@ -381,19 +381,20 @@ fn run_monitor_loop(
             x11rb::protocol::Event::ReparentNotify(e) => {
                 // Window was reparented - if it's reparented to root, we may want to track it
                 // If reparented away from root, the WM is managing it (this is normal)
-                if e.parent == root && !tracked.contains_key(&e.window) {
-                    if let Some(info) = query_window_info(&conn, e.window, &atoms) {
-                        let _ = conn.change_window_attributes(
-                            e.window,
-                            &xproto::ChangeWindowAttributesAux::new().event_mask(
-                                xproto::EventMask::PROPERTY_CHANGE
-                                    | xproto::EventMask::STRUCTURE_NOTIFY,
-                            ),
-                        );
-                        let _ = conn.flush();
-                        let _ = tx.send(WindowEvent::Added(info.clone()));
-                        tracked.insert(e.window, info);
-                    }
+                if e.parent == root
+                    && !tracked.contains_key(&e.window)
+                    && let Some(info) = query_window_info(&conn, e.window, &atoms)
+                {
+                    let _ = conn.change_window_attributes(
+                        e.window,
+                        &xproto::ChangeWindowAttributesAux::new().event_mask(
+                            xproto::EventMask::PROPERTY_CHANGE
+                                | xproto::EventMask::STRUCTURE_NOTIFY,
+                        ),
+                    );
+                    let _ = conn.flush();
+                    let _ = tx.send(WindowEvent::Added(info.clone()));
+                    tracked.insert(e.window, info);
                 }
             }
 
@@ -434,22 +435,22 @@ fn enumerate_windows(
         }
 
         // Also check children of children (WMs reparent windows)
-        if let Ok(subtree) = conn.query_tree(child) {
-            if let Ok(subtree) = subtree.reply() {
-                for &grandchild in &subtree.children {
-                    if tracked.contains_key(&grandchild) {
-                        continue;
-                    }
-                    if let Some(info) = query_window_info(conn, grandchild, atoms) {
-                        let _ = conn.change_window_attributes(
-                            grandchild,
-                            &xproto::ChangeWindowAttributesAux::new().event_mask(
-                                xproto::EventMask::PROPERTY_CHANGE
-                                    | xproto::EventMask::STRUCTURE_NOTIFY,
-                            ),
-                        );
-                        tracked.insert(grandchild, info);
-                    }
+        if let Ok(subtree) = conn.query_tree(child)
+            && let Ok(subtree) = subtree.reply()
+        {
+            for &grandchild in &subtree.children {
+                if tracked.contains_key(&grandchild) {
+                    continue;
+                }
+                if let Some(info) = query_window_info(conn, grandchild, atoms) {
+                    let _ = conn.change_window_attributes(
+                        grandchild,
+                        &xproto::ChangeWindowAttributesAux::new().event_mask(
+                            xproto::EventMask::PROPERTY_CHANGE
+                                | xproto::EventMask::STRUCTURE_NOTIFY,
+                        ),
+                    );
+                    tracked.insert(grandchild, info);
                 }
             }
         }
@@ -554,13 +555,11 @@ fn get_window_title(conn: &RustConnection, window: xproto::Window, atoms: &Atoms
     // Try _NET_WM_NAME first (UTF-8)
     if let Ok(cookie) =
         conn.get_property(false, window, atoms.net_wm_name, atoms.utf8_string, 0, 1024)
+        && let Ok(prop) = cookie.reply()
+        && prop.length > 0
     {
-        if let Ok(prop) = cookie.reply() {
-            if prop.length > 0 {
-                if let Ok(s) = std::str::from_utf8(&prop.value) {
-                    return s.to_string();
-                }
-            }
+        if let Ok(s) = std::str::from_utf8(&prop.value) {
+            return s.to_string();
         }
     }
 
@@ -572,12 +571,10 @@ fn get_window_title(conn: &RustConnection, window: xproto::Window, atoms: &Atoms
         xproto::AtomEnum::STRING,
         0,
         1024,
-    ) {
-        if let Ok(prop) = cookie.reply() {
-            if prop.length > 0 {
-                return String::from_utf8_lossy(&prop.value).to_string();
-            }
-        }
+    ) && let Ok(prop) = cookie.reply()
+        && prop.length > 0
+    {
+        return String::from_utf8_lossy(&prop.value).to_string();
     }
 
     String::new()
@@ -592,19 +589,17 @@ fn get_wm_class(conn: &RustConnection, window: xproto::Window, atoms: &Atoms) ->
         xproto::AtomEnum::STRING,
         0,
         256,
-    ) {
-        if let Ok(prop) = cookie.reply() {
-            if prop.length > 0 {
-                // WM_CLASS is two null-terminated strings: instance\0class\0
-                // We want the class (second string)
-                let parts: Vec<&[u8]> = prop.value.split(|&b| b == 0).collect();
-                if parts.len() >= 2 {
-                    return String::from_utf8_lossy(parts[1]).to_string();
-                }
-                if !parts.is_empty() {
-                    return String::from_utf8_lossy(parts[0]).to_string();
-                }
-            }
+    ) && let Ok(prop) = cookie.reply()
+        && prop.length > 0
+    {
+        // WM_CLASS is two null-terminated strings: instance\0class\0
+        // We want the class (second string)
+        let parts: Vec<&[u8]> = prop.value.split(|&b| b == 0).collect();
+        if parts.len() >= 2 {
+            return String::from_utf8_lossy(parts[1]).to_string();
+        }
+        if !parts.is_empty() {
+            return String::from_utf8_lossy(parts[0]).to_string();
         }
     }
     String::new()

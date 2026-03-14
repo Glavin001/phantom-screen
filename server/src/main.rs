@@ -424,11 +424,11 @@ async fn process_input_data_with_coherence(
                         let snapshot_data = coherence::serialize_window_event(&snapshot);
                         let session_for_snapshot = session.clone();
                         tokio::spawn(async move {
-                            if let Ok(stream_future) = session_for_snapshot.open_uni().await {
-                                if let Ok(mut stream) = stream_future.await {
-                                    let _ = stream.write_all(&snapshot_data).await;
-                                    let _ = stream.finish().await;
-                                }
+                            if let Ok(stream_future) = session_for_snapshot.open_uni().await
+                                && let Ok(mut stream) = stream_future.await
+                            {
+                                let _ = stream.write_all(&snapshot_data).await;
+                                let _ = stream.finish().await;
                             }
                         });
 
@@ -547,26 +547,26 @@ async fn process_input_data_with_coherence(
                     height,
                 } => {
                     let cs_lock = coherence_session.lock().await;
-                    if let Some(ref cs) = *cs_lock {
-                        if let Err(e) = cs.resize_window(*window_id, *width, *height) {
-                            warn!("Failed to resize window {}: {}", window_id, e);
-                        }
+                    if let Some(ref cs) = *cs_lock
+                        && let Err(e) = cs.resize_window(*window_id, *width, *height)
+                    {
+                        warn!("Failed to resize window {}: {}", window_id, e);
                     }
                 }
                 InputEvent::FocusWindow { window_id } => {
                     let cs_lock = coherence_session.lock().await;
-                    if let Some(ref cs) = *cs_lock {
-                        if let Err(e) = cs.focus_window(*window_id) {
-                            warn!("Failed to focus window {}: {}", window_id, e);
-                        }
+                    if let Some(ref cs) = *cs_lock
+                        && let Err(e) = cs.focus_window(*window_id)
+                    {
+                        warn!("Failed to focus window {}: {}", window_id, e);
                     }
                 }
                 InputEvent::CloseWindow { window_id } => {
                     let cs_lock = coherence_session.lock().await;
-                    if let Some(ref cs) = *cs_lock {
-                        if let Err(e) = cs.close_window(*window_id) {
-                            warn!("Failed to close window {}: {}", window_id, e);
-                        }
+                    if let Some(ref cs) = *cs_lock
+                        && let Err(e) = cs.close_window(*window_id)
+                    {
+                        warn!("Failed to close window {}: {}", window_id, e);
                     }
                 }
                 InputEvent::LaunchApp { command } => {
@@ -683,7 +683,7 @@ fn dispatch_event(
 
 /// Remove a stale X lock file if it exists. Returns true if a file was removed.
 fn cleanup_stale_display(display_num: u32) -> bool {
-    let lock_file = format!("/tmp/.X{}-lock", display_num);
+    let lock_file = format!("/tmp/.X{display_num}-lock");
     if std::path::Path::new(&lock_file).exists() {
         let _ = std::fs::remove_file(&lock_file);
         info!("Removed stale X lock file: {}", lock_file);
@@ -702,7 +702,7 @@ fn start_xvfb(config: &Config) -> Result<Child> {
     info!("Starting Xvfb on display {}", disp);
 
     let child = Command::new("Xvfb")
-        .args([disp, "-screen", "0", &format!("{}x24", resolution), "-ac"])
+        .args([disp, "-screen", "0", &format!("{resolution}x24"), "-ac"])
         .spawn()
         .context("Failed to start Xvfb")?;
 
@@ -719,8 +719,7 @@ fn start_window_manager(config: &Config) -> Result<Child> {
     info!("Starting window manager: {}", wm);
 
     let child = Command::new(wm).spawn().context(format!(
-        "Failed to start window manager '{}'. Is it installed?",
-        wm
+        "Failed to start window manager '{wm}'. Is it installed?"
     ))?;
 
     info!("Window manager started");
@@ -772,7 +771,7 @@ async fn run_http_server(
                     // Health/readiness endpoint
                     if path == "/health" {
                         let status = if pc.is_running() { "ready" } else { "starting" };
-                        let body = format!(r#"{{"status":"{}"}}"#, status);
+                        let body = format!(r#"{{"status":"{status}"}}"#);
                         return Ok::<_, Infallible>(
                             Response::builder()
                                 .status(200)

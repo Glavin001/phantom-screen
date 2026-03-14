@@ -102,7 +102,7 @@ impl InputHandler {
             .get(code)
             .copied()
             .or_else(|| dom_code_to_keycode_fallback(code))
-            .context(format!("Unknown key code: {}", code))?;
+            .context(format!("Unknown key code: {code}"))?;
 
         let event_type = if pressed { 2 } else { 3 }; // KeyPress / KeyRelease
         let root = self.root_window();
@@ -360,12 +360,12 @@ fn build_dom_to_x11_keycode_map() -> HashMap<String, u8> {
 
     // Digits
     for i in 0..=9u8 {
-        map.insert(format!("Digit{}", i), if i == 0 { 19 } else { 10 + i - 1 });
+        map.insert(format!("Digit{i}"), if i == 0 { 19 } else { 10 + i - 1 });
     }
 
     // Function keys (F1–F10 are 67–76, F11=95, F12=96 on standard X11)
     for i in 1..=10u8 {
-        map.insert(format!("F{}", i), 66 + i);
+        map.insert(format!("F{i}"), 66 + i);
     }
     map.insert("F11".into(), 95);
     map.insert("F12".into(), 96);
