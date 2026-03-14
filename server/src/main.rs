@@ -33,6 +33,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Install a non-fatal Xlib error handler. GStreamer's ximagesrc uses Xlib
+    // internally, and the default Xlib error handler calls exit(1) on any X
+    // error (e.g., BadWindow when a window is destroyed between detection and
+    // capture). Our handler logs the error instead of crashing the process.
+    install_xlib_error_handler();
+
     let config = Config::parse();
     info!("Phantom Screen Server starting");
     info!(
@@ -95,8 +101,11 @@ async fn main() -> Result<()> {
 
         let (window_event_tx, _) = broadcast::channel::<window_monitor::WindowEvent>(256);
 
-        // Forward window monitor events to the broadcast channel
+        // Forward window monitor events to the broadcast channel.
+        // The monitor thread auto-reconnects after Xvfb restarts, so
+        // this forwarder keeps running for the lifetime of the process.
         let tx_clone = window_event_tx.clone();
+        let tracked_for_forwarder = tracked_windows.clone();
         tokio::spawn(async move {
             let mut rx = window_rx;
             loop {
@@ -108,7 +117,11 @@ async fn main() -> Result<()> {
                         warn!("Window event forwarder lagged by {} events", n);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        info!("Window monitor closed");
+                        info!("Window monitor channel closed (process shutting down)");
+                        // Clear tracked windows so clients don't use stale IDs
+                        if let Ok(mut shared) = tracked_for_forwarder.lock() {
+                            shared.clear();
+                        }
                         break;
                     }
                 }
@@ -271,6 +284,59 @@ async fn main() -> Result<()> {
     info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Install a non-fatal Xlib error handler.
+///
+/// GStreamer elements like `ximagesrc` use Xlib (C library) internally. Xlib's
+/// default error handler prints the error and calls `exit(1)`, which kills the
+/// entire process on any X protocol error (e.g., BadWindow when a window is
+/// destroyed between detection and capture). This replaces it with a handler
+/// that logs a warning instead.
+fn install_xlib_error_handler() {
+    // Xlib FFI — minimal declarations for XSetErrorHandler.
+    // We only need the error handler; GStreamer already links libX11.
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct XErrorEvent {
+        _type: i32,
+        _display: *mut std::ffi::c_void,
+        resourceid: u64,
+        _serial: u64,
+        error_code: u8,
+        request_code: u8,
+        minor_code: u8,
+    }
+
+    type XErrorHandler =
+        Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut XErrorEvent) -> i32>;
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XSetErrorHandler(handler: XErrorHandler) -> XErrorHandler;
+    }
+
+    unsafe extern "C" fn non_fatal_error_handler(
+        _display: *mut std::ffi::c_void,
+        event: *mut XErrorEvent,
+    ) -> i32 {
+        let event = unsafe { &*event };
+        tracing::warn!(
+            error_code = event.error_code,
+            request_code = event.request_code,
+            resource_id = event.resourceid,
+            "X11 error (non-fatal): error={} request={} resource=0x{:x}",
+            event.error_code,
+            event.request_code,
+            event.resourceid,
+        );
+        0 // Return 0 — do NOT call exit()
+    }
+
+    unsafe {
+        XSetErrorHandler(Some(non_fatal_error_handler));
+    }
+    info!("Installed non-fatal Xlib error handler");
 }
 
 /// Resolves on SIGTERM or Ctrl-C.

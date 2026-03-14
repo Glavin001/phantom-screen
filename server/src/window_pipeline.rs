@@ -68,6 +68,19 @@ impl WindowPipelineManager {
             return Ok(wp.tx.subscribe());
         }
 
+        // Validate the window still exists before creating a GStreamer pipeline.
+        // GStreamer's ximagesrc uses Xlib internally and will trigger X errors
+        // (potentially fatal without our custom error handler) if the window
+        // ID is stale (e.g., from before an Xvfb restart).
+        if !validate_window_exists(&self.display, window_id) {
+            anyhow::bail!(
+                "Window {} (0x{:x}) does not exist on display {} — refusing to start pipeline",
+                window_id,
+                window_id,
+                self.display
+            );
+        }
+
         // Check pipeline limit
         if self.pipelines.len() as u32 >= self.max_pipelines {
             anyhow::bail!(
@@ -211,6 +224,37 @@ impl WindowPipelineManager {
     /// Number of active pipelines.
     pub fn active_count(&self) -> usize {
         self.pipelines.len()
+    }
+}
+
+/// Check if a window ID is valid on the given display using x11rb.
+///
+/// This uses the Rust x11rb library (not Xlib), which handles X errors
+/// gracefully via Result types instead of calling exit().
+fn validate_window_exists(x_display: &str, window_id: u32) -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    let conn = match x11rb::rust_connection::RustConnection::connect(Some(x_display)) {
+        Ok((conn, _)) => conn,
+        Err(e) => {
+            tracing::warn!("Cannot connect to {} to validate window: {}", x_display, e);
+            return false;
+        }
+    };
+
+    match conn.get_window_attributes(window_id) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!("Window 0x{:x} does not exist on {}: {}", window_id, x_display, e);
+                false
+            }
+        },
+        Err(e) => {
+            tracing::warn!("Failed to query window 0x{:x}: {}", window_id, e);
+            false
+        }
     }
 }
 

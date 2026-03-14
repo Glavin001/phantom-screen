@@ -214,6 +214,32 @@ fn run_monitor_loop(
     tx: &broadcast::Sender<WindowEvent>,
     shared_tracked: &TrackedWindows,
 ) -> Result<()> {
+    loop {
+        match run_monitor_session(display, tx, shared_tracked) {
+            Ok(()) => {
+                tracing::info!("Window monitor session ended cleanly");
+            }
+            Err(e) => {
+                tracing::warn!("Window monitor session error: {}", e);
+            }
+        }
+
+        // Clear stale tracked windows — old window IDs are invalid after Xvfb restart
+        if let Ok(mut shared) = shared_tracked.lock() {
+            shared.clear();
+        }
+
+        // Wait for the new X server to be ready before reconnecting
+        tracing::info!("Window monitor will reconnect in 2s...");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+fn run_monitor_session(
+    display: &str,
+    tx: &broadcast::Sender<WindowEvent>,
+    shared_tracked: &TrackedWindows,
+) -> Result<()> {
     let (conn, screen_num) = RustConnection::connect(Some(display))
         .context("Failed to connect to X11 for monitoring")?;
     let root = conn.setup().roots[screen_num].root;
@@ -241,7 +267,7 @@ fn run_monitor_loop(
     enumerate_windows(&conn, root, &atoms, &mut tracked)?;
 
     let snapshot: Vec<WindowInfo> = tracked.values().cloned().collect();
-    tracing::info!("Window monitor started, found {} windows", snapshot.len());
+    tracing::info!("Window monitor reconnected, found {} windows", snapshot.len());
     // Update shared state so late subscribers can get a fresh snapshot
     if let Ok(mut shared) = shared_tracked.lock() {
         *shared = tracked.clone();
@@ -253,8 +279,8 @@ fn run_monitor_loop(
         let event = match conn.wait_for_event() {
             Ok(e) => e,
             Err(e) => {
-                tracing::error!("X11 event error: {}", e);
-                break;
+                tracing::warn!("X11 connection lost: {}", e);
+                return Err(e.into());
             }
         };
 
