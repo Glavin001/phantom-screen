@@ -56,8 +56,9 @@ export class ControlManager {
     this.send(encodeBitrateRequest(kbps));
   }
 
-  /** Set the remote desktop resolution (from initial stream info) */
+  /** Set the remote desktop resolution (from initial stream info or server-side change) */
   setRemoteResolution(width: number, height: number) {
+    const changed = width !== this.remoteWidth || height !== this.remoteHeight;
     this.remoteWidth = width;
     this.remoteHeight = height;
     updateResolution(this.ui, width, height);
@@ -65,6 +66,28 @@ export class ControlManager {
     // Size the canvas to match
     this.ui.canvas.width = width;
     this.ui.canvas.height = height;
+
+    // If the resolution changed, try to resize the window to fit the new
+    // content. This works in pop-out windows (opened via window.open) and
+    // is silently ignored in normal browser tabs.
+    if (changed) {
+      this.resizeWindowToFit(width, height);
+    }
+  }
+
+  /**
+   * Attempt to resize the browser window so its inner content area matches
+   * the given dimensions. Accounts for window chrome (title bar, borders).
+   * Only effective in pop-out windows; silently ignored in normal tabs.
+   */
+  private resizeWindowToFit(width: number, height: number) {
+    try {
+      const chromeWidth = window.outerWidth - window.innerWidth;
+      const chromeHeight = window.outerHeight - window.innerHeight;
+      window.resizeTo(width + chromeWidth, height + chromeHeight);
+    } catch {
+      // resizeTo may throw in some browser security contexts; ignore.
+    }
   }
 
   getRemoteWidth(): number { return this.remoteWidth; }
