@@ -53,7 +53,25 @@ describe('mountPhantomScreen', () => {
     client.destroy();
   });
 
-  it('shows a helpful error when WebTransport is unavailable', async () => {
+  it('shows a helpful error when WebTransport is forced but unavailable', async () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+
+    const client = mountPhantomScreen(root, {
+      useShadowDom: false,
+      serverUrl: 'https://127.0.0.1:4443',
+      transport: 'webtransport',
+    });
+
+    await client.connect();
+
+    expect(client.getState()).toBe('error');
+    expect(root.textContent).toContain('WebTransport is not available in this browser');
+
+    client.destroy();
+  });
+
+  it('falls back to WebRTC when WebTransport is unavailable in auto mode', async () => {
     const root = document.createElement('div');
     document.body.append(root);
 
@@ -64,8 +82,10 @@ describe('mountPhantomScreen', () => {
 
     await client.connect();
 
+    // In jsdom, neither WebTransport nor RTCPeerConnection exists,
+    // so the WebRTC fallback also fails.
     expect(client.getState()).toBe('error');
-    expect(root.textContent).toContain('WebTransport is not available in this browser');
+    expect(root.textContent).toContain('Failed to connect');
 
     client.destroy();
   });

@@ -1,8 +1,10 @@
 import { ClipboardSync } from './clipboard';
 import { ControlManager } from './control';
-import { createServerCertificateHashes, type ServerCertificateHash } from './hash';
+import { type ServerCertificateHash } from './hash';
 import { attachInputListeners, type InputSender } from './input';
 import { DEFAULT_SERVER_URL, renderTemplate } from './template';
+import { type Transport, type TransportType, WebTransportAdapter } from './transport';
+import { WebRtcTransport } from './webrtc-transport';
 import {
   getCanvasScale,
   getUIElements,
@@ -26,6 +28,10 @@ export interface PhantomScreenMountOptions {
   useShadowDom?: boolean;
   decoderHardwareAcceleration?: DecoderHardwareAcceleration;
   onStateChange?: (state: ConnectionState, message: string) => void;
+  /** Transport selection: 'auto' tries WebTransport first, falls back to WebRTC */
+  transport?: TransportType;
+  /** ICE servers for WebRTC (default: Google STUN) */
+  iceServers?: RTCIceServer[];
 }
 
 type CleanupFn = () => void;
@@ -41,12 +47,12 @@ export class PhantomScreenClient {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly cleanupUi: CleanupFn[];
   private state: ConnectionState = 'disconnected';
-  private transport: WebTransport | null = null;
-  private inputWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private activeTransport: Transport | null = null;
   private decoder: VideoDecoder | null = null;
   private controlManager: ControlManager | null = null;
   private cleanupInput: CleanupFn | null = null;
   private clipboardSync = new ClipboardSync();
+  private videoElement: HTMLVideoElement | null = null;
 
   constructor(root: HTMLElement, options: PhantomScreenMountOptions = {}) {
     this.options = options;
@@ -120,44 +126,48 @@ export class PhantomScreenClient {
     this.ui.serverUrlInput.value = serverUrl;
 
     try {
-      if (typeof WebTransport === 'undefined') {
-        throw new Error('WebTransport is not available in this browser');
-      }
+      const transportMode = this.options.transport ?? 'auto';
+      const transport = await this.createTransport(transportMode, serverUrl);
+      this.activeTransport = transport;
 
-      const transportOptions = this.resolveTransportOptions();
-      this.transport = transportOptions
-        ? new WebTransport(serverUrl, transportOptions)
-        : new WebTransport(serverUrl);
-
-      const currentTransport = this.transport;
-      currentTransport.closed
+      // Handle transport close
+      transport.closed
         .then(() => {
-          if (this.transport === currentTransport) {
+          if (this.activeTransport === transport) {
             this.disconnect(false);
             this.updateState('disconnected', 'Connection closed');
           }
         })
         .catch((error) => {
-          if (this.transport === currentTransport) {
+          if (this.activeTransport === transport) {
             this.disconnect(false);
             this.updateState('error', `Connection lost: ${toErrorMessage(error)}`);
           }
         });
 
-      await currentTransport.ready;
       this.updateState('connected', 'Connected');
 
-      const biStream = await currentTransport.createBidirectionalStream();
-      this.inputWriter = biStream.writable.getWriter();
-
       const send: InputSender = (data: Uint8Array) => {
-        this.inputWriter?.write(data).catch(() => {
-          // Ignore writes after disconnects.
-        });
+        this.activeTransport?.sendInput(data);
       };
 
       this.controlManager = new ControlManager(send, this.ui);
-      this.setupDecoder();
+
+      // Set up video rendering based on transport type
+      const mediaStream = transport.getMediaStream();
+      if (mediaStream) {
+        // WebRTC: render video via <video> element
+        this.setupWebRtcVideo(mediaStream);
+      } else {
+        // WebTransport: decode video frames via WebCodecs
+        this.setupDecoder();
+        transport.onVideoFrame((data) => this.handleVideoFrame(data));
+      }
+
+      // Handle incoming data (clipboard from server)
+      transport.onData((data) => {
+        void this.handleIncomingData(data);
+      });
 
       this.cleanupInput = attachInputListeners(
         this.ui.canvas,
@@ -170,9 +180,6 @@ export class PhantomScreenClient {
       );
 
       this.ui.canvas.focus();
-
-      void this.readVideoStreams(currentTransport);
-      void this.readInputResponses(biStream.readable.getReader());
     } catch (error) {
       this.disconnect(false);
       this.updateState('error', `Failed to connect: ${toErrorMessage(error)}`);
@@ -193,14 +200,14 @@ export class PhantomScreenClient {
     }
     this.decoder = null;
 
-    const writer = this.inputWriter;
-    this.inputWriter = null;
-    void writer?.close().catch(() => {
-      // Stream already closed.
-    });
+    if (this.videoElement) {
+      this.videoElement.srcObject = null;
+      this.videoElement.remove();
+      this.videoElement = null;
+    }
 
-    const transport = this.transport;
-    this.transport = null;
+    const transport = this.activeTransport;
+    this.activeTransport = null;
     try {
       transport?.close();
     } catch {
@@ -220,6 +227,82 @@ export class PhantomScreenClient {
       cleanup();
     }
     this.renderRoot.innerHTML = '';
+  }
+
+  private async createTransport(mode: TransportType, serverUrl: string): Promise<Transport> {
+    const useWebTransport =
+      mode === 'webtransport' ||
+      (mode === 'auto' && typeof WebTransport !== 'undefined');
+
+    if (useWebTransport) {
+      return WebTransportAdapter.connect({
+        serverUrl,
+        manualHash: this.ui.certHashInput.value.trim() || undefined,
+        certificateHashes: this.options.serverCertificateHashes,
+        singleHash: this.options.serverCertificateHash,
+      });
+    }
+
+    // WebRTC fallback
+    // Derive the signaling URL from the server URL
+    // Server URL is typically https://host:4443, HTTP is on port+1 (4444)
+    const signalingUrl = this.deriveSignalingUrl(serverUrl);
+    return WebRtcTransport.connect({
+      signalingUrl,
+      iceServers: this.options.iceServers,
+    });
+  }
+
+  private deriveSignalingUrl(serverUrl: string): string {
+    try {
+      const url = new URL(serverUrl);
+      const port = parseInt(url.port || '4443', 10);
+      // HTTP server runs on port+1
+      return `${url.protocol === 'https:' ? 'https' : 'http'}://${url.hostname}:${port + 1}`;
+    } catch {
+      // Fallback: assume same origin
+      return window.location.origin;
+    }
+  }
+
+  private setupWebRtcVideo(mediaStream: MediaStream): void {
+    // Create a hidden <video> element to receive the WebRTC media stream
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+    video.srcObject = mediaStream;
+    video.style.display = 'none';
+    this.renderRoot.appendChild(video);
+    this.videoElement = video;
+
+    // Draw video frames to the canvas
+    const drawFrame = () => {
+      if (!this.videoElement || this.videoElement.paused || this.videoElement.ended) return;
+
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        if (this.ui.canvas.width !== video.videoWidth || this.ui.canvas.height !== video.videoHeight) {
+          this.ui.canvas.width = video.videoWidth;
+          this.ui.canvas.height = video.videoHeight;
+          this.controlManager?.setRemoteResolution(video.videoWidth, video.videoHeight);
+        }
+
+        const startDraw = performance.now();
+        this.ctx.drawImage(video, 0, 0);
+        const drawTime = performance.now() - startDraw;
+        this.controlManager?.recordFrame(drawTime);
+      }
+
+      requestAnimationFrame(drawFrame);
+    };
+
+    video.addEventListener('playing', () => {
+      requestAnimationFrame(drawFrame);
+    });
+
+    void video.play().catch(() => {
+      // Autoplay may be blocked; user interaction needed.
+    });
   }
 
   private getRenderRoot(root: HTMLElement, useShadowDom: boolean): ShadowRoot | HTMLElement {
@@ -248,32 +331,6 @@ export class PhantomScreenClient {
     this.state = state;
     setConnectionState(this.ui, state, message);
     this.options.onStateChange?.(state, message);
-  }
-
-  private resolveTransportOptions():
-    | ConstructorParameters<typeof WebTransport>[1]
-    | undefined {
-    const manualHash = this.ui.certHashInput.value.trim();
-    if (manualHash) {
-      return {
-        serverCertificateHashes: createServerCertificateHashes(manualHash),
-      };
-    }
-
-    if (this.options.serverCertificateHashes?.length) {
-      return {
-        serverCertificateHashes: this.options.serverCertificateHashes,
-      };
-    }
-
-    const singleHash = createServerCertificateHashes(this.options.serverCertificateHash);
-    if (singleHash) {
-      return {
-        serverCertificateHashes: singleHash,
-      };
-    }
-
-    return undefined;
   }
 
   private setupDecoder(): void {
@@ -309,54 +366,8 @@ export class PhantomScreenClient {
     });
   }
 
-  private async readVideoStreams(transport: WebTransport): Promise<void> {
-    const reader = transport.incomingUnidirectionalStreams.getReader();
-
-    try {
-      while (true) {
-        const { value: stream, done } = await reader.read();
-        if (done) {
-          break;
-        }
-        void this.processVideoStream(stream);
-      }
-    } catch {
-      // Ignore stream shutdowns during disconnect.
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
-  private async processVideoStream(stream: ReadableStream<Uint8Array>): Promise<void> {
-    const reader = stream.getReader();
-    const chunks: Uint8Array[] = [];
-    let totalLength = 0;
-
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
-        chunks.push(value);
-        totalLength += value.length;
-      }
-    } catch {
-      return;
-    } finally {
-      reader.releaseLock();
-    }
-
-    if (totalLength < 13) {
-      return;
-    }
-
-    const data = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      data.set(chunk, offset);
-      offset += chunk.length;
-    }
+  private handleVideoFrame(data: Uint8Array): void {
+    if (data.length < 13) return;
 
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const flags = data[0];
@@ -382,29 +393,14 @@ export class PhantomScreenClient {
     }
   }
 
-  private async readInputResponses(
-    reader: ReadableStreamDefaultReader<Uint8Array>,
-  ): Promise<void> {
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
-
-        if (value && value.length >= 5 && value[0] === 0x20) {
-          const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
-          const textLength = view.getUint32(1, false);
-          if (value.length >= 5 + textLength) {
-            const text = new TextDecoder().decode(value.slice(5, 5 + textLength));
-            await this.clipboardSync.receiveClipboard(text);
-          }
-        }
+  private async handleIncomingData(value: Uint8Array): Promise<void> {
+    if (value && value.length >= 5 && value[0] === 0x20) {
+      const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+      const textLength = view.getUint32(1, false);
+      if (value.length >= 5 + textLength) {
+        const text = new TextDecoder().decode(value.slice(5, 5 + textLength));
+        await this.clipboardSync.receiveClipboard(text);
       }
-    } catch {
-      // Ignore stream shutdowns during disconnect.
-    } finally {
-      reader.releaseLock();
     }
   }
 }
