@@ -247,7 +247,8 @@ async fn handle_session(
                 // Subscribe to the current pipeline's broadcast channel
                 let mut frame_rx = watch_rx.borrow_and_update().subscribe();
 
-                loop {
+                // Stream frames until the pipeline stops or restarts
+                let restart = loop {
                     tokio::select! {
                         frame_result = frame_rx.recv() => {
                             match frame_result {
@@ -261,8 +262,10 @@ async fn handle_session(
                                     warn!("Video receiver lagged by {} frames, skipping", n);
                                 }
                                 Err(broadcast::error::RecvError::Closed) => {
-                                    // Pipeline stopped, wait for restart
-                                    break;
+                                    // Pipeline stopped; wait for watch notification
+                                    // rather than immediately re-subscribing (the new
+                                    // pipeline may not be published yet).
+                                    break false;
                                 }
                             }
                         }
@@ -274,7 +277,21 @@ async fn handle_session(
                             }
                             // New pipeline available, re-subscribe
                             info!("Pipeline restarted, re-subscribing to video frames");
-                            break;
+                            break true;
+                        }
+                    }
+                };
+
+                // If we broke out due to Closed (not a watch notification),
+                // wait for the new pipeline to be published before re-subscribing.
+                if !restart {
+                    match watch_rx.changed().await {
+                        Ok(()) => {
+                            info!("Pipeline restarted, re-subscribing to video frames");
+                        }
+                        Err(_) => {
+                            info!("Pipeline manager closed, stopping video sender");
+                            return;
                         }
                     }
                 }
