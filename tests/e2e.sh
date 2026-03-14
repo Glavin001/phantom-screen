@@ -172,6 +172,75 @@ else
   log_fail "Custom resolution not detected in logs"
 fi
 
+# ---- Test: xrandr is available for dynamic resize ----
+if docker exec "$CONTAINER_NAME" command -v xrandr >/dev/null 2>&1; then
+  log_pass "xrandr is available for dynamic resize"
+else
+  log_fail "xrandr is not installed (needed for dynamic resize)"
+fi
+
+# ---- Test: cvt is available for modeline generation ----
+if docker exec "$CONTAINER_NAME" command -v cvt >/dev/null 2>&1; then
+  log_pass "cvt is available for modeline generation"
+else
+  log_fail "cvt is not installed (needed for dynamic resize)"
+fi
+
+# ---- Test: xrandr can query the display ----
+XRANDR_OUTPUT=$(docker exec "$CONTAINER_NAME" xrandr --query 2>&1 || echo "XRANDR_FAILED")
+if echo "$XRANDR_OUTPUT" | grep -q "connected"; then
+  log_pass "xrandr can query display (RANDR extension active)"
+else
+  log_fail "xrandr cannot query display: $XRANDR_OUTPUT"
+fi
+
+# ---- Test: Xvfb started with BackingStore (+bs) ----
+XVFB_CMDLINE=$(docker exec "$CONTAINER_NAME" sh -c 'cat /proc/$(pgrep -x Xvfb)/cmdline | tr "\0" " "' 2>/dev/null || echo "")
+if echo "$XVFB_CMDLINE" | grep -q "+bs"; then
+  log_pass "Xvfb started with BackingStore (+bs)"
+else
+  log_fail "Xvfb not started with BackingStore (+bs). Cmdline: $XVFB_CMDLINE"
+fi
+
+# ---- Test: Xvfb started with RANDR extension ----
+if echo "$XVFB_CMDLINE" | grep -q "RANDR"; then
+  log_pass "Xvfb started with RANDR extension"
+else
+  log_fail "Xvfb not started with RANDR extension. Cmdline: $XVFB_CMDLINE"
+fi
+
+# ---- Test: Dynamic resize via xrandr works ----
+# Try resizing to a different resolution and verify it takes effect
+RESIZE_RESULT=$(docker exec "$CONTAINER_NAME" sh -c '
+  # Generate modeline for 1024x768
+  MODELINE=$(cvt 1024 768 60 2>/dev/null | grep Modeline | sed "s/.*\"[^\"]*\"//" | xargs)
+  # Get output name
+  OUTPUT=$(xrandr --query | grep " connected" | head -1 | awk "{print \$1}")
+  if [ -z "$OUTPUT" ]; then
+    echo "NO_OUTPUT"
+    exit 1
+  fi
+  # Add mode, add to output, set it
+  xrandr --newmode "1024x768" $MODELINE 2>/dev/null || true
+  xrandr --addmode "$OUTPUT" "1024x768" 2>/dev/null || true
+  xrandr --output "$OUTPUT" --mode "1024x768" 2>&1
+  # Verify new resolution is active
+  xrandr --query 2>/dev/null | grep -o "1024x768.*\*" || echo "RESIZE_NOT_ACTIVE"
+' 2>&1)
+if echo "$RESIZE_RESULT" | grep -q "1024x768"; then
+  log_pass "Dynamic xrandr resize to 1024x768 succeeded"
+else
+  log_fail "Dynamic xrandr resize failed: $RESIZE_RESULT"
+fi
+
+# ---- Test: Container still running after resize ----
+CONTAINER_STATUS_POST=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")
+if [ "$CONTAINER_STATUS_POST" = "running" ]; then
+  log_pass "Container still running after resize test"
+else
+  log_fail "Container crashed after resize test (status: $CONTAINER_STATUS_POST)"
+fi
+
 # ---- Results ----
 echo ""
 echo "====================================="

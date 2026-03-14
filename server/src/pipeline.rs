@@ -203,98 +203,73 @@ impl PipelineManager {
     }
 }
 
-/// Resize the Xvfb display using xrandr.
+/// Resize the Xvfb display by restarting it at the new resolution.
 ///
-/// Attempts to add a new mode matching the requested resolution and apply it.
-/// Falls back gracefully if the mode already exists.
-fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
+/// Xvfb has limited RANDR support and cannot add new modes dynamically.
+/// The reliable approach is to kill the current Xvfb and start a fresh one
+/// at the requested resolution with BackingStore and RANDR enabled.
+pub fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
     use std::process::Command;
 
-    let mode_name = format!("{}x{}", width, height);
+    let resolution = format!("{}x{}", width, height);
 
-    // Try to generate modeline with cvt
-    let cvt_output = Command::new("cvt")
-        .args([&width.to_string(), &height.to_string(), "60"])
-        .env("DISPLAY", display)
-        .output()
-        .context("Failed to run cvt")?;
-
-    let cvt_str = String::from_utf8_lossy(&cvt_output.stdout);
-    // Parse the Modeline from cvt output (second line, after "Modeline")
-    let modeline = cvt_str
-        .lines()
-        .find(|l| l.contains("Modeline"))
-        .and_then(|l| l.split_once('"'))
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(_, params)| params.trim().to_string());
-
-    if let Some(params) = modeline {
-        // Add new mode (ignore errors if it already exists)
-        let _ = Command::new("xrandr")
-            .args(["--newmode", &mode_name])
-            .args(params.split_whitespace())
-            .env("DISPLAY", display)
-            .output();
-
-        // Add mode to the default output
-        // Xvfb typically uses "screen" as the output name
-        let outputs = get_xrandr_output(display);
-        let output_name = outputs.unwrap_or_else(|| "screen".to_string());
-
-        let _ = Command::new("xrandr")
-            .args(["--addmode", &output_name, &mode_name])
-            .env("DISPLAY", display)
-            .output();
-
-        // Apply the mode
-        let result = Command::new("xrandr")
-            .args(["--output", &output_name, "--mode", &mode_name])
-            .env("DISPLAY", display)
-            .output()
-            .context("Failed to set xrandr mode")?;
-
-        if result.status.success() {
-            tracing::info!("xrandr: set mode {} on output {}", mode_name, output_name);
-            return Ok(());
+    // Kill existing Xvfb on this display
+    // Find Xvfb processes matching our display
+    let pgrep = Command::new("pgrep")
+        .args(["-a", "-x", "Xvfb"])
+        .output();
+    if let Ok(output) = pgrep {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.contains(display) {
+                if let Some(pid_str) = line.split_whitespace().next() {
+                    if let Ok(pid) = pid_str.parse::<i32>() {
+                        tracing::info!("Killing existing Xvfb (pid {}) for resize", pid);
+                        let _ = Command::new("kill")
+                            .args(["-TERM", pid_str])
+                            .output();
+                    }
+                }
+            }
         }
-
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        tracing::warn!(
-            "xrandr --mode failed: {}, trying --fb fallback",
-            stderr.trim()
-        );
     }
 
-    // Fallback: use --fb to set framebuffer size directly
-    let result = Command::new("xrandr")
-        .args(["--fb", &format!("{}x{}", width, height)])
-        .env("DISPLAY", display)
-        .output()
-        .context("Failed to run xrandr --fb")?;
+    // Wait for old Xvfb to die and release the display
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        anyhow::bail!("xrandr resize failed: {}", stderr.trim());
+    // Remove stale lock file
+    let display_num = display.trim_start_matches(':');
+    let lock_file = format!("/tmp/.X{}-lock", display_num);
+    let _ = std::fs::remove_file(&lock_file);
+
+    // Start new Xvfb at the requested resolution
+    let child = Command::new("Xvfb")
+        .args([
+            display,
+            "-screen", "0", &format!("{}x24", resolution),
+            "-ac",
+            "+bs",
+            "+extension", "RANDR",
+        ])
+        .spawn()
+        .context("Failed to start new Xvfb")?;
+
+    {
+        let d = display;
+        tracing::info!("Started new Xvfb (pid={}) at {} on {}", child.id(), resolution, d);
     }
 
-    tracing::info!("xrandr: set framebuffer to {}x{}", width, height);
+    // Wait for new Xvfb to be ready
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Restart window manager on the display
+    let _ = Command::new("sh")
+        .args(["-c", &format!("DISPLAY={} openbox &", display)])
+        .spawn();
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    tracing::info!("Display resized to {} via Xvfb restart", resolution);
     Ok(())
-}
-
-/// Get the first connected output name from xrandr.
-fn get_xrandr_output(display: &str) -> Option<String> {
-    let output = std::process::Command::new("xrandr")
-        .arg("--query")
-        .env("DISPLAY", display)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.contains(" connected") {
-            return line.split_whitespace().next().map(|s| s.to_string());
-        }
-    }
-    None
 }
 
 /// Start the GStreamer capture/encode pipeline.
