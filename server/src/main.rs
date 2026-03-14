@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 
 use config::Config;
@@ -228,6 +228,73 @@ async fn shutdown_signal() {
     }
 }
 
+/// Core video sender loop: subscribes to pipeline broadcast channels via the
+/// watch channel, and calls `send_frame` for each frame. Automatically
+/// re-subscribes when the pipeline restarts (new broadcast sender published).
+///
+/// Extracted from `handle_session` so it can be unit-tested without WebTransport.
+async fn video_sender_loop<F, Fut>(
+    mut watch_rx: watch::Receiver<broadcast::Sender<EncodedFrame>>,
+    send_frame: F,
+) where
+    F: Fn(EncodedFrame) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send,
+{
+    loop {
+        // Subscribe to the current pipeline's broadcast channel
+        let mut frame_rx = watch_rx.borrow_and_update().subscribe();
+
+        // Stream frames until the pipeline stops or restarts
+        let restart = loop {
+            tokio::select! {
+                frame_result = frame_rx.recv() => {
+                    match frame_result {
+                        Ok(frame) => {
+                            if let Err(e) = send_frame(frame).await {
+                                warn!("Failed to send video frame: {}", e);
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Video receiver lagged by {} frames, skipping", n);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Pipeline stopped; wait for watch notification
+                            // rather than immediately re-subscribing (the new
+                            // pipeline may not be published yet).
+                            break false;
+                        }
+                    }
+                }
+                result = watch_rx.changed() => {
+                    if result.is_err() {
+                        // PipelineManager dropped, shut down
+                        info!("Pipeline manager closed, stopping video sender");
+                        return;
+                    }
+                    // New pipeline available, re-subscribe
+                    info!("Pipeline restarted, re-subscribing to video frames");
+                    break true;
+                }
+            }
+        };
+
+        // If we broke out due to Closed (not a watch notification),
+        // wait for the new pipeline to be published before re-subscribing.
+        if !restart {
+            match watch_rx.changed().await {
+                Ok(()) => {
+                    info!("Pipeline restarted, re-subscribing to video frames");
+                }
+                Err(_) => {
+                    info!("Pipeline manager closed, stopping video sender");
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn handle_session(
     session: wtransport::Connection,
     pipeline_manager: Arc<PipelineManager>,
@@ -240,63 +307,16 @@ async fn handle_session(
     // Spawn video sender that handles pipeline restarts via watch channel
     {
         let session_video = session.clone();
-        let mut watch_rx = pipeline_manager.subscribe_watch();
+        let watch_rx = pipeline_manager.subscribe_watch();
 
-        tokio::spawn(async move {
-            loop {
-                // Subscribe to the current pipeline's broadcast channel
-                let mut frame_rx = watch_rx.borrow_and_update().subscribe();
-
-                // Stream frames until the pipeline stops or restarts
-                let restart = loop {
-                    tokio::select! {
-                        frame_result = frame_rx.recv() => {
-                            match frame_result {
-                                Ok(frame) => {
-                                    if let Err(e) = send_video_frame(&session_video, &frame).await {
-                                        warn!("Failed to send video frame: {}", e);
-                                        return;
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(n)) => {
-                                    warn!("Video receiver lagged by {} frames, skipping", n);
-                                }
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    // Pipeline stopped; wait for watch notification
-                                    // rather than immediately re-subscribing (the new
-                                    // pipeline may not be published yet).
-                                    break false;
-                                }
-                            }
-                        }
-                        result = watch_rx.changed() => {
-                            if result.is_err() {
-                                // PipelineManager dropped, shut down
-                                info!("Pipeline manager closed, stopping video sender");
-                                return;
-                            }
-                            // New pipeline available, re-subscribe
-                            info!("Pipeline restarted, re-subscribing to video frames");
-                            break true;
-                        }
-                    }
-                };
-
-                // If we broke out due to Closed (not a watch notification),
-                // wait for the new pipeline to be published before re-subscribing.
-                if !restart {
-                    match watch_rx.changed().await {
-                        Ok(()) => {
-                            info!("Pipeline restarted, re-subscribing to video frames");
-                        }
-                        Err(_) => {
-                            info!("Pipeline manager closed, stopping video sender");
-                            return;
-                        }
-                    }
-                }
+        tokio::spawn(video_sender_loop(watch_rx, move |frame| {
+            let session = session_video.clone();
+            async move {
+                send_video_frame(&session, &frame)
+                    .await
+                    .map_err(|e| e.to_string())
             }
-        });
+        }));
     }
 
     // Handle bidirectional streams for input
@@ -708,6 +728,302 @@ mod tests {
 
             let resp = sender.send_request(req).await.unwrap();
             assert_eq!(resp.status(), 404);
+        }
+    }
+
+    /// Tests for the video_sender_loop: the async coordination between
+    /// watch channels (pipeline restarts) and broadcast channels (frame delivery).
+    ///
+    /// These tests exercise the exact race conditions that caused streaming to
+    /// break after resize — no GStreamer, no WebTransport, no X11 needed.
+    mod video_sender {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{broadcast, watch};
+
+        fn test_frame(pts: u64) -> EncodedFrame {
+            EncodedFrame {
+                data: vec![0u8; 8],
+                pts,
+                is_keyframe: pts == 0,
+            }
+        }
+
+        /// Basic test: frames sent on the initial pipeline are received.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn receives_frames_from_initial_pipeline() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe to the broadcast channel
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Send some frames
+            for i in 0..5 {
+                tx1.send(test_frame(i)).unwrap();
+            }
+
+            // Give the loop time to process
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(received.load(Ordering::SeqCst), 5);
+
+            // Drop the watch sender to shut down the loop
+            drop(watch_tx);
+            drop(tx1);
+            let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        }
+
+        /// Simulates a pipeline restart where the watch channel notifies
+        /// BEFORE the broadcast channel closes (the happy path).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn resubscribes_when_watch_notifies_before_broadcast_closes() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Send frames on pipeline 1
+            tx1.send(test_frame(0)).unwrap();
+            tx1.send(test_frame(1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Simulate pipeline restart: create new sender, publish via watch, THEN drop old
+            let (tx2, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx2.clone()).unwrap();
+            drop(tx1); // old broadcast closes after watch already notified
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Send frames on pipeline 2
+            tx2.send(test_frame(2)).unwrap();
+            tx2.send(test_frame(3)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            assert_eq!(received.load(Ordering::SeqCst), 4);
+
+            drop(watch_tx);
+            drop(tx2);
+            let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        }
+
+        /// THE KEY BUG TEST: Simulates the race condition where the broadcast
+        /// channel closes BEFORE the watch channel is updated (because resize
+        /// runs synchronously: stop pipeline → sleep → restart → publish).
+        ///
+        /// Before the fix, the video sender would immediately re-subscribe to
+        /// the stale broadcast channel and get Closed again, missing all frames.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn resubscribes_when_broadcast_closes_before_watch_updates() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Send frames on pipeline 1
+            tx1.send(test_frame(0)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+
+            // Simulate the race: drop old broadcast FIRST (pipeline.stop())
+            drop(tx1);
+
+            // Simulate the delay from Xvfb restart (the gap where the bug occurs)
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // NOW publish the new pipeline via watch (like resize() does after restart)
+            let (tx2, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx2.clone()).unwrap();
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Send frames on pipeline 2 — these MUST be received
+            tx2.send(test_frame(1)).unwrap();
+            tx2.send(test_frame(2)).unwrap();
+            tx2.send(test_frame(3)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                4,
+                "Video sender must receive frames after pipeline restart even when \
+                 broadcast closes before watch channel updates (the resize race condition)"
+            );
+
+            drop(watch_tx);
+            drop(tx2);
+            let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        }
+
+        /// Multiple sequential resizes (the scenario from the bug report:
+        /// resize to 1350x1198, then to 1645x1198). Each resize drops the old
+        /// broadcast before publishing the new one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn survives_multiple_sequential_resizes() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Pipeline 1: send a frame
+            tx1.send(test_frame(0)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Resize 1: drop old, delay, publish new (the race)
+            drop(tx1);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let (tx2, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx2.clone()).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            tx2.send(test_frame(1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Resize 2: drop old, delay, publish new (the race again)
+            drop(tx2);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let (tx3, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx3.clone()).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            tx3.send(test_frame(2)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Resize 3: one more for good measure
+            drop(tx3);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let (tx4, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx4.clone()).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            tx4.send(test_frame(3)).unwrap();
+            tx4.send(test_frame(4)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                5,
+                "Video sender must survive multiple sequential resizes"
+            );
+
+            drop(watch_tx);
+            drop(tx4);
+            let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        }
+
+        /// When the PipelineManager is dropped (shutdown), the video sender
+        /// should exit cleanly rather than hang or panic.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn exits_when_pipeline_manager_dropped() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, |_frame| async { Ok(()) }));
+
+            // Drop everything — the loop should exit
+            drop(tx1);
+            drop(watch_tx);
+
+            let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+            assert!(
+                result.is_ok(),
+                "Video sender must exit promptly when pipeline manager is dropped"
+            );
+        }
+
+        /// When send_frame returns an error, the loop should exit (connection lost).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn exits_on_send_error() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (_watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, |_frame| async {
+                Err("connection lost".to_string())
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            tx1.send(test_frame(0)).unwrap();
+
+            let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+            assert!(
+                result.is_ok(),
+                "Video sender must exit when send_frame fails"
+            );
+        }
+
+        /// When broadcast channel lags (too many frames buffered), the sender
+        /// should skip and continue rather than crash.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn handles_broadcast_lag_without_crashing() {
+            // Small buffer to force lag
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(2);
+            let (_watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let _handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Flood the channel to cause lag
+            for i in 0..10 {
+                let _ = tx1.send(test_frame(i));
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Should have received at least some frames (not crashed)
+            assert!(
+                received.load(Ordering::SeqCst) > 0,
+                "Video sender must handle lag gracefully"
+            );
         }
     }
 }
