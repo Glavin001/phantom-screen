@@ -5,6 +5,9 @@ mod config;
 mod control;
 mod input;
 mod pipeline;
+mod signaling;
+mod transport;
+mod webrtc_transport;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -14,12 +17,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use config::Config;
 use input::{InputEvent, InputHandler, estimate_event_length, parse_input_event};
-use pipeline::EncodedFrame;
+use transport::TransportSession;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -107,12 +109,27 @@ async fn main() -> Result<()> {
 
     info!("WebTransport server listening on {}", config.listen);
 
+    // Set up WebRTC signaling state if enabled
+    let signaling_state = if config.enable_webrtc {
+        if let Some(webrtcbin) = pipeline_controller.webrtcbin() {
+            let state = signaling::SignalingState::new(webrtcbin.clone());
+            info!("WebRTC signaling enabled");
+            Some(state)
+        } else {
+            warn!("WebRTC enabled but webrtcbin element not found in pipeline");
+            None
+        }
+    } else {
+        None
+    };
+
     // Also start an HTTP server for serving static files and health checks
     let http_addr = SocketAddr::new(config.listen.ip(), config.listen.port() + 1);
     let client_dir = config.client_dir.clone();
     let pc_for_http = pipeline_controller.clone();
+    let signaling_for_http = signaling_state.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(http_addr, client_dir, pc_for_http).await {
+        if let Err(e) = run_http_server(http_addr, client_dir, pc_for_http, signaling_for_http).await {
             error!("HTTP server error: {}", e);
         }
     });
@@ -178,16 +195,18 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let frame_rx = if pipeline_controller.is_running() {
-                    Some(frame_rx.resubscribe())
-                } else {
-                    None
-                };
+                let wt_session = Arc::new(transport::WebTransportSession::new(session));
+
+                // Spawn video sender for WebTransport
+                if pipeline_controller.is_running() {
+                    wt_session.spawn_video_sender(frame_rx.resubscribe());
+                }
+
                 let pc = pipeline_controller.clone();
                 let ih = input_handler.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_session(session, frame_rx, pc, ih).await {
+                    if let Err(e) = handle_session(wt_session, pc, ih).await {
                         warn!("Session ended: {}", e);
                     }
                 });
@@ -225,90 +244,28 @@ async fn shutdown_signal() {
 }
 
 async fn handle_session(
-    session: wtransport::Connection,
-    frame_rx: Option<broadcast::Receiver<EncodedFrame>>,
+    session: Arc<dyn TransportSession>,
     pipeline_controller: Arc<pipeline::PipelineController>,
     input_handler: Arc<InputHandler>,
 ) -> Result<()> {
     info!("Client connected");
 
-    let session = Arc::new(session);
-
-    // Spawn video sender - uses unidirectional streams for reliability
-    if let Some(mut rx) = frame_rx {
-        let session_video = session.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(frame) => {
-                        if let Err(e) = send_video_frame(&session_video, &frame).await {
-                            warn!("Failed to send video frame: {}", e);
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Video receiver lagged by {} frames, skipping", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        info!("Pipeline closed, stopping video sender");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    // Handle bidirectional streams for input
+    // Read input from the transport session
     loop {
-        match session.accept_bi().await {
-            Ok((mut send, mut recv)) => {
-                let ih = input_handler.clone();
-                let pc = pipeline_controller.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    loop {
-                        match recv.read(&mut buf).await {
-                            Ok(Some(n)) if n > 0 => {
-                                process_input_data(&buf[..n], &ih, &pc);
-                            }
-                            Ok(_) => break,
-                            Err(e) => {
-                                warn!("Input stream error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    // Close our side
-                    let _ = send.finish().await;
-                });
+        match session.recv_input().await {
+            Ok(Some(data)) => {
+                process_input_data(&data, &input_handler, &pipeline_controller);
+            }
+            Ok(None) => {
+                info!("Session closed");
+                return Ok(());
             }
             Err(e) => {
-                info!("Session closed: {}", e);
+                warn!("Session error: {}", e);
                 return Ok(());
             }
         }
     }
-}
-
-/// Send an encoded video frame over a unidirectional stream
-///
-/// Frame format:
-/// [flags: u8] [pts: u64 BE] [length: u32 BE] [H.264 data...]
-///   flags: bit 0 = keyframe
-async fn send_video_frame(session: &wtransport::Connection, frame: &EncodedFrame) -> Result<()> {
-    let mut stream = session.open_uni().await?.await?;
-
-    let flags: u8 = if frame.is_keyframe { 0x01 } else { 0x00 };
-    let mut header = [0u8; 13];
-    header[0] = flags;
-    header[1..9].copy_from_slice(&frame.pts.to_be_bytes());
-    header[9..13].copy_from_slice(&(frame.data.len() as u32).to_be_bytes());
-
-    stream.write_all(&header).await?;
-    stream.write_all(&frame.data).await?;
-    stream.finish().await?;
-
-    Ok(())
 }
 
 fn process_input_data(
@@ -402,14 +359,15 @@ fn start_window_manager(config: &Config) -> Result<Child> {
     Ok(child)
 }
 
-/// Simple HTTP server for serving static files and the /health endpoint
+/// Simple HTTP server for serving static files, health checks, and WebRTC signaling
 async fn run_http_server(
     addr: SocketAddr,
     client_dir: String,
     pipeline_controller: Arc<pipeline::PipelineController>,
+    signaling_state: Option<Arc<signaling::SignalingState>>,
 ) -> Result<()> {
     use hyper::body::Incoming;
-    use hyper::{Request, Response};
+    use hyper::{Method, Request, Response};
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
 
@@ -421,13 +379,29 @@ async fn run_http_server(
         let (stream, _) = listener.accept().await?;
         let client_dir = client_dir.clone();
         let pc = pipeline_controller.clone();
+        let sig = signaling_state.clone();
 
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let client_dir = client_dir.clone();
                 let pc = pc.clone();
+                let sig = sig.clone();
                 async move {
-                    let path = req.uri().path();
+                    let path = req.uri().path().to_string();
+                    let method = req.method().clone();
+
+                    // CORS preflight
+                    if method == Method::OPTIONS {
+                        return Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(204)
+                                .header("Access-Control-Allow-Origin", "*")
+                                .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                                .header("Access-Control-Allow-Headers", "Content-Type")
+                                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                                .unwrap(),
+                        );
+                    }
 
                     // Health/readiness endpoint
                     if path == "/health" {
@@ -441,6 +415,17 @@ async fn run_http_server(
                                 .body(http_body_util::Full::new(bytes::Bytes::from(body)))
                                 .unwrap(),
                         );
+                    }
+
+                    // WebRTC signaling endpoints
+                    if path == "/webrtc/offer" && method == Method::POST {
+                        return Ok(handle_webrtc_offer(req, sig.as_ref()).await);
+                    }
+                    if path == "/webrtc/candidate" && method == Method::POST {
+                        return Ok(handle_webrtc_candidate(req, sig.as_ref()).await);
+                    }
+                    if path == "/webrtc/candidates" && method == Method::GET {
+                        return Ok(handle_webrtc_candidates(sig.as_ref()));
                     }
 
                     let file_path = if path == "/" || path.is_empty() {
@@ -486,6 +471,92 @@ async fn run_http_server(
             }
         });
     }
+}
+
+fn json_response(
+    status: u16,
+    body: &str,
+) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+    hyper::Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(http_body_util::Full::new(bytes::Bytes::from(
+            body.to_string(),
+        )))
+        .unwrap()
+}
+
+async fn handle_webrtc_offer(
+    req: hyper::Request<hyper::body::Incoming>,
+    signaling: Option<&Arc<signaling::SignalingState>>,
+) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+    use http_body_util::BodyExt;
+
+    let sig = match signaling {
+        Some(s) => s,
+        None => return json_response(404, r#"{"error":"WebRTC not enabled"}"#),
+    };
+
+    let body = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return json_response(400, r#"{"error":"Failed to read body"}"#),
+    };
+
+    let offer: signaling::SdpMessage = match serde_json::from_slice(&body) {
+        Ok(o) => o,
+        Err(_) => return json_response(400, r#"{"error":"Invalid JSON"}"#),
+    };
+
+    match sig.handle_offer(&offer.sdp) {
+        Ok(answer_sdp) => {
+            let answer = signaling::SdpMessage { sdp: answer_sdp };
+            let json = serde_json::to_string(&answer).unwrap();
+            json_response(200, &json)
+        }
+        Err(e) => {
+            warn!("Failed to handle WebRTC offer: {}", e);
+            json_response(500, &format!(r#"{{"error":"{}"}}"#, e))
+        }
+    }
+}
+
+async fn handle_webrtc_candidate(
+    req: hyper::Request<hyper::body::Incoming>,
+    signaling: Option<&Arc<signaling::SignalingState>>,
+) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+    use http_body_util::BodyExt;
+
+    let sig = match signaling {
+        Some(s) => s,
+        None => return json_response(404, r#"{"error":"WebRTC not enabled"}"#),
+    };
+
+    let body = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return json_response(400, r#"{"error":"Failed to read body"}"#),
+    };
+
+    let candidate: signaling::IceCandidate = match serde_json::from_slice(&body) {
+        Ok(c) => c,
+        Err(_) => return json_response(400, r#"{"error":"Invalid JSON"}"#),
+    };
+
+    sig.add_ice_candidate(&candidate);
+    json_response(200, r#"{"ok":true}"#)
+}
+
+fn handle_webrtc_candidates(
+    signaling: Option<&Arc<signaling::SignalingState>>,
+) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+    let sig = match signaling {
+        Some(s) => s,
+        None => return json_response(404, r#"{"error":"WebRTC not enabled"}"#),
+    };
+
+    let candidates = sig.drain_ice_candidates();
+    let json = serde_json::to_string(&candidates).unwrap();
+    json_response(200, &json)
 }
 
 #[cfg(test)]
@@ -582,7 +653,7 @@ mod tests {
             let bound_addr = listener.local_addr().unwrap();
             drop(listener); // Release so run_http_server can bind
 
-            tokio::spawn(run_http_server(bound_addr, client_dir, pc));
+            tokio::spawn(run_http_server(bound_addr, client_dir, pc, None));
 
             // Give it time to bind
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -638,7 +709,7 @@ mod tests {
             let bound_addr = listener.local_addr().unwrap();
             drop(listener);
 
-            tokio::spawn(run_http_server(bound_addr, client_dir, pc));
+            tokio::spawn(run_http_server(bound_addr, client_dir, pc, None));
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             use hyper_util::rt::TokioIo;

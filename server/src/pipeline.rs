@@ -21,6 +21,7 @@ pub struct EncodedFrame {
 pub struct PipelineController {
     pipeline: gstreamer::Pipeline,
     encoder: gstreamer::Element,
+    webrtcbin: Option<gstreamer::Element>,
     bitrate: AtomicU32,
     running: AtomicBool,
 }
@@ -46,6 +47,11 @@ impl PipelineController {
         self.running.load(Ordering::Relaxed)
     }
 
+    /// Get a reference to the webrtcbin element, if WebRTC is enabled.
+    pub fn webrtcbin(&self) -> Option<&gstreamer::Element> {
+        self.webrtcbin.as_ref()
+    }
+
     /// Create a dummy controller for testing (no real GStreamer pipeline).
     #[cfg(test)]
     pub(crate) fn new_for_test(running: bool) -> Arc<Self> {
@@ -59,6 +65,7 @@ impl PipelineController {
         Arc::new(Self {
             pipeline,
             encoder: fakesink,
+            webrtcbin: None,
             bitrate: AtomicU32::new(6000),
             running: AtomicBool::new(running),
         })
@@ -99,6 +106,11 @@ pub fn start_pipeline(
         .by_name("encoder")
         .context("No element named 'encoder' in pipeline")?;
 
+    let webrtcbin = pipeline.by_name("webrtc");
+    if webrtcbin.is_some() {
+        tracing::info!("WebRTC pipeline path enabled (webrtcbin found)");
+    }
+
     let (tx, rx) = broadcast::channel::<EncodedFrame>(120);
 
     appsink.set_callbacks(
@@ -137,6 +149,7 @@ pub fn start_pipeline(
     let controller = Arc::new(PipelineController {
         pipeline,
         encoder,
+        webrtcbin,
         bitrate: AtomicU32::new(config.bitrate),
         running: AtomicBool::new(true),
     });
@@ -145,6 +158,14 @@ pub fn start_pipeline(
 }
 
 pub(crate) fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {
+    build_pipeline_string_webrtc(config, encoder_type, config.enable_webrtc)
+}
+
+pub(crate) fn build_pipeline_string_webrtc(
+    config: &Config,
+    encoder_type: EncoderType,
+    enable_webrtc: bool,
+) -> String {
     let display = &config.display;
     let fps = config.fps;
     let bitrate = config.bitrate;
@@ -183,14 +204,32 @@ pub(crate) fn build_pipeline_string(config: &Config, encoder_type: EncoderType) 
         }
     };
 
-    format!(
-        "ximagesrc display-name={display} use-damage=0 show-pointer=true \
-         ! video/x-raw,framerate={fps}/1 \
-         {scale_part}\
-         ! {encoder_part} \
-         ! video/x-h264,stream-format=byte-stream,alignment=au \
-         ! appsink name=sink emit-signals=true sync=false"
-    )
+    if enable_webrtc {
+        // Dual-path pipeline: tee splits to appsink (WebTransport) and webrtcbin (WebRTC)
+        format!(
+            "ximagesrc display-name={display} use-damage=0 show-pointer=true \
+             ! video/x-raw,framerate={fps}/1 \
+             {scale_part}\
+             ! {encoder_part} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! tee name=splitter \
+             splitter. ! queue ! appsink name=sink emit-signals=true sync=false \
+             splitter. ! queue ! h264parse ! rtph264pay config-interval=1 pt=96 aggregate-mode=zero-latency \
+             ! application/x-rtp,media=video,encoding-name=H264,payload=96 \
+             ! webrtcbin name=webrtc bundle-policy=max-bundle stun-server={stun}",
+            stun = config.stun_server,
+        )
+    } else {
+        // Single-path pipeline: direct to appsink only
+        format!(
+            "ximagesrc display-name={display} use-damage=0 show-pointer=true \
+             ! video/x-raw,framerate={fps}/1 \
+             {scale_part}\
+             ! {encoder_part} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink emit-signals=true sync=false"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +252,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            enable_webrtc: false,
+            stun_server: "stun://stun.l.google.com:19302".into(),
+            turn_server: None,
         }
     }
 
@@ -317,5 +359,36 @@ mod tests {
                 "Missing alignment=au for {encoder:?}"
             );
         }
+    }
+
+    #[test]
+    fn pipeline_string_webrtc_disabled_no_tee() {
+        let config = default_config();
+        let result = build_pipeline_string_webrtc(&config, EncoderType::X264, false);
+        assert!(!result.contains("tee name=splitter"));
+        assert!(!result.contains("webrtcbin"));
+        assert!(result.contains("appsink name=sink"));
+    }
+
+    #[test]
+    fn pipeline_string_webrtc_enabled_has_tee_and_webrtcbin() {
+        let config = default_config();
+        let result = build_pipeline_string_webrtc(&config, EncoderType::X264, true);
+        assert!(result.contains("tee name=splitter"));
+        assert!(result.contains("webrtcbin name=webrtc"));
+        assert!(result.contains("appsink name=sink"));
+        assert!(result.contains("h264parse"));
+        assert!(result.contains("rtph264pay"));
+        assert!(result.contains("config-interval=1"));
+        assert!(result.contains("aggregate-mode=zero-latency"));
+        assert!(result.contains("stun-server="));
+    }
+
+    #[test]
+    fn pipeline_string_webrtc_includes_stun_server() {
+        let mut config = default_config();
+        config.stun_server = "stun://custom.stun.server:3478".into();
+        let result = build_pipeline_string_webrtc(&config, EncoderType::X264, true);
+        assert!(result.contains("stun-server=stun://custom.stun.server:3478"));
     }
 }

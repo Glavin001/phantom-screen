@@ -64,6 +64,18 @@ pub struct Config {
     /// a lower resolution to clients.
     #[arg(long)]
     pub stream_resolution: Option<String>,
+
+    /// Enable WebRTC as a fallback transport (requires gst-plugins-bad for webrtcbin)
+    #[arg(long)]
+    pub enable_webrtc: bool,
+
+    /// STUN server URL for WebRTC ICE
+    #[arg(long, default_value = "stun://stun.l.google.com:19302")]
+    pub stun_server: String,
+
+    /// TURN server URL for WebRTC ICE (optional, for restrictive NATs)
+    #[arg(long)]
+    pub turn_server: Option<String>,
 }
 
 impl Config {
@@ -155,6 +167,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            enable_webrtc: false,
+            stun_server: "stun://stun.l.google.com:19302".into(),
+            turn_server: None,
         };
 
         assert_eq!(config.resolution_width(), 1920);
@@ -178,6 +193,9 @@ mod tests {
             jwt_secret: Some("secret".into()),
             post_start_command: None,
             stream_resolution: None,
+            enable_webrtc: false,
+            stun_server: "stun://stun.l.google.com:19302".into(),
+            turn_server: None,
         };
 
         assert_eq!(config.resolution_width(), 2560);
@@ -202,6 +220,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            enable_webrtc: false,
+            stun_server: "stun://stun.l.google.com:19302".into(),
+            turn_server: None,
         };
 
         assert_eq!(config.resolution_width(), 1920); // fallback
@@ -226,6 +247,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            enable_webrtc: false,
+            stun_server: "stun://stun.l.google.com:19302".into(),
+            turn_server: None,
         };
         // Without stream_resolution, falls back to desktop resolution
         assert_eq!(config.stream_resolution_width(), 1920);
@@ -254,6 +278,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            enable_webrtc: false,
+            stun_server: "stun://stun.l.google.com:19302".into(),
+            turn_server: None,
         };
         assert_eq!(config.display_num(), 42);
     }
