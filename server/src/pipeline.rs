@@ -9,6 +9,41 @@ use tokio::sync::{broadcast, watch};
 
 use crate::config::{Config, EncoderType, detect_encoder};
 
+/// Query the current resolution of an X11 display using xdpyinfo.
+///
+/// Returns `(width, height)` or an error if the display cannot be queried.
+pub fn query_display_resolution(display: &str) -> Result<(u16, u16)> {
+    use std::process::Command;
+
+    let output = Command::new("xdpyinfo")
+        .env("DISPLAY", display)
+        .output()
+        .context("Failed to run xdpyinfo")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Look for "dimensions:    1920x1080 pixels"
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("dimensions:") {
+            // e.g. "dimensions:    1920x1080 pixels"
+            if let Some(dim_str) = trimmed
+                .strip_prefix("dimensions:")
+                .and_then(|s| s.trim().split_whitespace().next())
+            {
+                let mut parts = dim_str.split('x');
+                if let (Some(w), Some(h)) = (parts.next(), parts.next()) {
+                    let width: u16 = w.parse().context("Invalid width from xdpyinfo")?;
+                    let height: u16 = h.parse().context("Invalid height from xdpyinfo")?;
+                    return Ok((width, height));
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("Could not parse display resolution from xdpyinfo output")
+}
+
 /// Encoded H.264 frame data
 #[derive(Clone, Debug)]
 pub struct EncodedFrame {
@@ -142,6 +177,45 @@ impl PipelineManager {
         let _ = self.frame_watch_tx.send(new_tx);
 
         tracing::info!("Pipeline restarted at {}x{}", width, height);
+        Ok(())
+    }
+
+    /// Restart the pipeline without changing the display.
+    ///
+    /// Use this when the display resolution changed externally (e.g. xrandr)
+    /// and the pipeline needs to re-capture at the new size.
+    pub fn restart_pipeline(&self, new_width: u16, new_height: u16) -> Result<()> {
+        let mut config = self.config.lock().unwrap();
+
+        tracing::info!(
+            "Restarting pipeline for external resolution change to {}x{}",
+            new_width,
+            new_height
+        );
+
+        // Update config to reflect the new display resolution
+        config.resolution = format!("{}x{}", new_width, new_height);
+        config.stream_resolution = None;
+
+        // Stop old pipeline
+        {
+            let controller = self.controller.lock().unwrap();
+            controller.stop();
+        }
+
+        // Brief pause for stability
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Start new pipeline at new resolution
+        let (new_tx, new_controller) = start_pipeline_inner(&config, self.encoder_type)?;
+
+        {
+            let mut controller = self.controller.lock().unwrap();
+            *controller = new_controller;
+        }
+
+        let _ = self.frame_watch_tx.send(new_tx);
+        tracing::info!("Pipeline restarted at {}x{}", new_width, new_height);
         Ok(())
     }
 
@@ -294,6 +368,50 @@ pub fn start_pipeline(
     });
 
     Ok((frame_rx, manager))
+}
+
+/// Spawn a background task that monitors the X display for resolution changes.
+///
+/// Polls `xdpyinfo` at regular intervals and restarts the pipeline when the
+/// display resolution differs from the pipeline's current config. This handles
+/// the case where something external (xrandr, an app) changes the display
+/// resolution without going through the client resize path.
+pub fn spawn_resolution_monitor(
+    pipeline_manager: Arc<PipelineManager>,
+    display: String,
+    poll_interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(poll_interval);
+        // First tick completes immediately; skip it so we don't check on startup
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let (current_w, current_h) = {
+                let config = pipeline_manager.config.lock().unwrap();
+                (config.resolution_width() as u16, config.resolution_height() as u16)
+            };
+
+            match query_display_resolution(&display) {
+                Ok((actual_w, actual_h)) => {
+                    if actual_w != current_w || actual_h != current_h {
+                        tracing::info!(
+                            "Display resolution changed externally: {}x{} -> {}x{}",
+                            current_w, current_h, actual_w, actual_h
+                        );
+                        if let Err(e) = pipeline_manager.restart_pipeline(actual_w, actual_h) {
+                            tracing::error!("Failed to restart pipeline after external resize: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Resolution monitor: could not query display: {}", e);
+                }
+            }
+        }
+    })
 }
 
 /// Internal: create a new pipeline, returning the broadcast sender and controller.
