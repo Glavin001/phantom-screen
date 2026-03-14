@@ -24,6 +24,9 @@ impl WindowPipeline {
     fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
         let _ = self.pipeline.set_state(gstreamer::State::Null);
+        // Wait for state change to complete so ximagesrc closes its X connection
+        // before Xvfb is killed during resize
+        let _ = self.pipeline.state(gstreamer::ClockTime::from_seconds(5));
     }
 
     fn pause(&self) {

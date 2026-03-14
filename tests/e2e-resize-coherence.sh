@@ -53,7 +53,7 @@ trap cleanup EXIT
 
 # ---- Prerequisites ----
 echo "Checking prerequisites..."
-for cmd in Xvfb openbox xrandr xdotool curl xdpyinfo; do
+for cmd in Xvfb openbox xrandr xdotool curl; do
   if ! command -v "$cmd" &>/dev/null; then
     log_fail "Required command not found: $cmd"
     exit 1
@@ -115,11 +115,15 @@ log_pass "Server started within ${WAITED}s"
 # ---- Verify initial state ----
 export DISPLAY="$DISPLAY_NUM"
 
-# Check Composite extension is active
-if xdpyinfo 2>/dev/null | grep -qi "composite"; then
-  log_pass "Composite extension active on initial Xvfb"
+# Check Composite extension is active (requires xdpyinfo)
+if command -v xdpyinfo &>/dev/null; then
+  if xdpyinfo 2>/dev/null | grep -qi "composite"; then
+    log_pass "Composite extension active on initial Xvfb"
+  else
+    log_fail "Composite extension not found on initial Xvfb"
+  fi
 else
-  log_fail "Composite extension not found on initial Xvfb"
+  log_info "xdpyinfo not available, skipping Composite extension check"
 fi
 
 # Check window monitor started
@@ -262,10 +266,14 @@ else
 fi
 
 # ---- Test 7: Xdpyinfo still shows Composite on new Xvfb ----
-if DISPLAY="$DISPLAY_NUM" xdpyinfo 2>/dev/null | grep -qi "composite"; then
-  log_pass "Composite extension active on new Xvfb after resize"
+if command -v xdpyinfo &>/dev/null; then
+  if DISPLAY="$DISPLAY_NUM" xdpyinfo 2>/dev/null | grep -qi "composite"; then
+    log_pass "Composite extension active on new Xvfb after resize"
+  else
+    log_fail "Composite extension not found on new Xvfb"
+  fi
 else
-  log_fail "Composite extension not found on new Xvfb"
+  log_info "xdpyinfo not available, skipping post-resize Composite check"
 fi
 
 # ---- Test 8: Launch new windows on the resized display ----
