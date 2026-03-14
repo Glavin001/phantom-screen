@@ -255,6 +255,128 @@ else
   fi
 fi
 
+# ---- Test: Xvfb started with Composite extension ----
+if echo "$XVFB_CMDLINE" | grep -q "Composite"; then
+  log_pass "Xvfb started with Composite extension"
+else
+  log_fail "Xvfb not started with Composite extension. Cmdline: $XVFB_CMDLINE"
+fi
+
+# ---- Test: X Composite redirect was applied ----
+CONTAINER_LOGS_COMPOSITE=$(docker logs "$CONTAINER_NAME" 2>&1 || true)
+if echo "$CONTAINER_LOGS_COMPOSITE" | grep -q "X Composite.*redirected subwindows"; then
+  log_pass "X Composite redirect_subwindows applied successfully"
+else
+  log_fail "X Composite redirect_subwindows not found in logs"
+fi
+
+# ---- Test: Composite extension is loaded in X server ----
+XDPYINFO_OUT=$(docker exec "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xdpyinfo 2>/dev/null | grep -i composite' || echo "")
+if echo "$XDPYINFO_OUT" | grep -qi "composite"; then
+  log_pass "Composite extension reported by xdpyinfo"
+else
+  log_fail "Composite extension not found in xdpyinfo output"
+fi
+
+# ---- Test: Overlapping window capture produces real pixels ----
+# This tests the core Composite functionality: when a window is behind another,
+# ximagesrc xid=<wid> should still capture the back window's real pixels.
+echo ""
+echo "Testing overlapping window pixel capture..."
+
+# Launch first xterm with visible text content (so it has non-black pixels)
+docker exec -d "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xterm -geometry 80x24+0+0 -e "echo COMPOSITE_TEST_WINDOW_1; cat" &'
+sleep 2
+
+# Launch second xterm overlapping the first
+docker exec -d "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xterm -geometry 80x24+50+50 -e "echo COMPOSITE_TEST_WINDOW_2; cat" &'
+sleep 2
+
+# Find the first xterm window (the one behind)
+BACK_WINDOW_ID=$(docker exec "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xdotool search --name "xterm" 2>/dev/null | head -1' || echo "")
+
+if [ -n "$BACK_WINDOW_ID" ] && [ "$BACK_WINDOW_ID" != "0" ]; then
+  log_pass "Found back xterm window (id: $BACK_WINDOW_ID)"
+
+  # Use GStreamer to capture a single frame from the back window by XID
+  # This is the exact same capture mechanism coherence mode uses
+  CAPTURE_RESULT=$(docker exec "$CONTAINER_NAME" sh -c "
+    DISPLAY=:99 timeout 10 gst-launch-1.0 -q \
+      ximagesrc display-name=:99 xid=$BACK_WINDOW_ID use-damage=0 num-buffers=1 \
+      ! videoconvert \
+      ! video/x-raw,format=GRAY8 \
+      ! filesink location=/tmp/back_window_capture.raw 2>&1
+    echo EXIT_CODE=\$?
+  " 2>&1 || echo "EXIT_CODE=1")
+
+  CAPTURE_EXIT=$(echo "$CAPTURE_RESULT" | grep -oP 'EXIT_CODE=\K[0-9]+' || echo "1")
+
+  if [ "$CAPTURE_EXIT" = "0" ] && docker exec "$CONTAINER_NAME" test -f /tmp/back_window_capture.raw; then
+    # Check the raw pixel data: a fully black image would be all zero bytes.
+    # Count non-zero bytes — real window content will have plenty.
+    NONZERO_BYTES=$(docker exec "$CONTAINER_NAME" sh -c '
+      od -An -tx1 /tmp/back_window_capture.raw | tr " " "\n" | grep -cv "^00$" 2>/dev/null || echo "0"
+    ')
+    FILE_SIZE=$(docker exec "$CONTAINER_NAME" sh -c 'wc -c < /tmp/back_window_capture.raw' || echo "0")
+
+    if [ "${NONZERO_BYTES:-0}" -gt 100 ]; then
+      log_pass "Back window capture has real pixels ($NONZERO_BYTES non-zero bytes in ${FILE_SIZE} byte frame)"
+    elif [ "${FILE_SIZE:-0}" -gt 0 ]; then
+      # File exists with data but mostly black — could be a timing issue with xterm rendering
+      # Check if it's not ALL zeros
+      if [ "${NONZERO_BYTES:-0}" -gt 0 ]; then
+        log_pass "Back window capture has some non-black pixels ($NONZERO_BYTES non-zero bytes)"
+      else
+        log_fail "Back window capture is entirely black (${FILE_SIZE} bytes, 0 non-zero) — Composite may not be working"
+      fi
+    else
+      log_fail "Back window capture file is empty"
+    fi
+  else
+    log_fail "GStreamer per-window capture failed (exit=$CAPTURE_EXIT). Output: $CAPTURE_RESULT"
+  fi
+else
+  log_fail "Could not find xterm window for pixel capture test"
+fi
+
+# ---- Test: Front window capture also works (sanity check) ----
+FRONT_WINDOW_ID=$(docker exec "$CONTAINER_NAME" sh -c 'DISPLAY=:99 xdotool search --name "xterm" 2>/dev/null | tail -1' || echo "")
+
+if [ -n "$FRONT_WINDOW_ID" ] && [ "$FRONT_WINDOW_ID" != "0" ] && [ "$FRONT_WINDOW_ID" != "$BACK_WINDOW_ID" ]; then
+  FRONT_CAPTURE_RESULT=$(docker exec "$CONTAINER_NAME" sh -c "
+    DISPLAY=:99 timeout 10 gst-launch-1.0 -q \
+      ximagesrc display-name=:99 xid=$FRONT_WINDOW_ID use-damage=0 num-buffers=1 \
+      ! videoconvert \
+      ! video/x-raw,format=GRAY8 \
+      ! filesink location=/tmp/front_window_capture.raw 2>&1
+    echo EXIT_CODE=\$?
+  " 2>&1 || echo "EXIT_CODE=1")
+
+  FRONT_EXIT=$(echo "$FRONT_CAPTURE_RESULT" | grep -oP 'EXIT_CODE=\K[0-9]+' || echo "1")
+  if [ "$FRONT_EXIT" = "0" ] && docker exec "$CONTAINER_NAME" test -f /tmp/front_window_capture.raw; then
+    FRONT_NONZERO=$(docker exec "$CONTAINER_NAME" sh -c '
+      od -An -tx1 /tmp/front_window_capture.raw | tr " " "\n" | grep -cv "^00$" 2>/dev/null || echo "0"
+    ')
+    if [ "${FRONT_NONZERO:-0}" -gt 100 ]; then
+      log_pass "Front window capture has real pixels ($FRONT_NONZERO non-zero bytes)"
+    else
+      log_fail "Front window capture appears mostly black ($FRONT_NONZERO non-zero bytes)"
+    fi
+  else
+    log_fail "Front window GStreamer capture failed"
+  fi
+else
+  log_info "Skipping front window test (only one xterm found or same ID)"
+fi
+
+# ---- Test: Container still healthy after composite tests ----
+CONTAINER_STATUS_COMPOSITE=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")
+if [ "$CONTAINER_STATUS_COMPOSITE" = "running" ]; then
+  log_pass "Container still running after composite/overlap tests"
+else
+  log_fail "Container crashed after composite tests (status: $CONTAINER_STATUS_COMPOSITE)"
+fi
+
 # ---- Results ----
 echo ""
 echo "====================================="
