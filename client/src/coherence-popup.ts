@@ -142,7 +142,14 @@ export class WindowPopup {
       this.canvas?.focus();
     });
 
-    // Focus the X11 window when the canvas gets focus
+    // Focus/raise the X11 window on mousedown (not just browser focus).
+    // This ensures clicking a background window raises it immediately,
+    // even if the canvas already has browser focus.
+    this.canvas.addEventListener('mousedown', () => {
+      this.send(encodeFocusWindow(this.windowId));
+    });
+
+    // Also send focus when the canvas gets browser focus (e.g., via Tab key)
     this.canvas.addEventListener('focus', () => {
       this.send(encodeFocusWindow(this.windowId));
     });
@@ -218,8 +225,13 @@ export class WindowPopup {
       this.onClose?.();
     });
 
-    // Focus the X11 window when the popup gets focus
+    // Focus/raise the X11 window when the popup or canvas is interacted with
     this.popup.addEventListener('focus', () => {
+      this.send(encodeFocusWindow(this.windowId));
+    });
+
+    // On mousedown: raise/focus the X11 window AND focus the canvas for keyboard
+    canvas.addEventListener('mousedown', () => {
       this.send(encodeFocusWindow(this.windowId));
     });
 

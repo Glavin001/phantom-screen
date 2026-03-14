@@ -112,6 +112,10 @@ impl PipelineController {
 /// Sessions subscribe to `frame_watch` to receive new broadcast senders whenever the
 /// pipeline restarts. On each restart the old broadcast sender is dropped (causing
 /// receivers to see `Closed`), and a new sender is published through the watch channel.
+/// Callback invoked before Xvfb is killed for resize, allowing other
+/// subsystems to shut down their X connections gracefully.
+pub type PreResizeHook = Box<dyn Fn() + Send + Sync>;
+
 pub struct PipelineManager {
     config: Mutex<Config>,
     encoder_type: EncoderType,
@@ -119,14 +123,21 @@ pub struct PipelineManager {
     frame_watch_tx: watch::Sender<broadcast::Sender<EncodedFrame>>,
     input_handler: Option<Arc<InputHandler>>,
     post_start_command: Option<String>,
+    pre_resize_hooks: Mutex<Vec<PreResizeHook>>,
 }
 
 impl PipelineManager {
+    /// Register a hook that runs before Xvfb is killed for resize.
+    /// Use this to stop per-window pipelines or other X clients.
+    pub fn add_pre_resize_hook(&self, hook: PreResizeHook) {
+        self.pre_resize_hooks.lock().unwrap().push(hook);
+    }
+
     /// Resize the display and restart the pipeline.
     ///
-    /// 1. Calls `xrandr` to change the Xvfb resolution.
-    /// 2. Stops the current pipeline.
-    /// 3. Starts a new pipeline with the new resolution.
+    /// 1. Stops all GStreamer pipelines (main + per-window via hooks).
+    /// 2. Kills and restarts Xvfb at the new resolution.
+    /// 3. Starts a new main pipeline.
     /// 4. Publishes the new broadcast sender so sessions re-subscribe.
     pub fn resize(&self, width: u16, height: u16) -> Result<()> {
         let mut config = self.config.lock().unwrap();
@@ -155,6 +166,18 @@ impl PipelineManager {
             let controller = self.controller.lock().unwrap();
             controller.stop();
         }
+
+        // Run pre-resize hooks (e.g., stop per-window pipelines)
+        // This ensures all GStreamer X connections are closed before Xvfb is killed.
+        {
+            let hooks = self.pre_resize_hooks.lock().unwrap();
+            for hook in hooks.iter() {
+                hook();
+            }
+        }
+
+        // Brief pause to let GStreamer elements fully release X connections
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Resize the virtual display (kills and restarts Xvfb)
         resize_display(&config.display, width, height)?;
@@ -299,6 +322,7 @@ impl PipelineManager {
             frame_watch_tx: watch_tx,
             input_handler: None,
             post_start_command: None,
+            pre_resize_hooks: Mutex::new(Vec::new()),
         })
     }
 }
@@ -401,6 +425,7 @@ pub fn start_pipeline(
         frame_watch_tx: watch_tx,
         input_handler,
         post_start_command,
+        pre_resize_hooks: Mutex::new(Vec::new()),
     });
 
     Ok((frame_rx, manager))

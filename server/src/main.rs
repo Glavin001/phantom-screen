@@ -145,6 +145,27 @@ async fn main() -> Result<()> {
     };
     info!("Coherence mode support initialized");
 
+    // Register pre-resize hook: stop all per-window pipelines before Xvfb is killed.
+    // This prevents GStreamer's ximagesrc from holding open Xlib connections that
+    // would trigger fatal XIO errors when the X server goes away.
+    {
+        let wpm = coherence_state.pipeline_manager.clone();
+        pipeline_manager.add_pre_resize_hook(Box::new(move || {
+            if let Ok(mut mgr) = wpm.try_lock() {
+                let count = mgr.active_count();
+                if count > 0 {
+                    tracing::info!(
+                        "Pre-resize: stopping {} per-window pipeline(s)",
+                        count
+                    );
+                    mgr.stop_all();
+                }
+            } else {
+                tracing::warn!("Pre-resize: could not lock window pipeline manager");
+            }
+        }));
+    }
+
     // Build WebTransport server config
     let identity = if let (Some(cert_path), Some(key_path)) = (&config.cert, &config.key) {
         wtransport::Identity::load_pemfiles(cert_path, key_path)
@@ -286,16 +307,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Install a non-fatal Xlib error handler.
+/// Install non-fatal Xlib error handlers (both protocol errors and IO errors).
 ///
-/// GStreamer elements like `ximagesrc` use Xlib (C library) internally. Xlib's
-/// default error handler prints the error and calls `exit(1)`, which kills the
-/// entire process on any X protocol error (e.g., BadWindow when a window is
-/// destroyed between detection and capture). This replaces it with a handler
-/// that logs a warning instead.
+/// GStreamer elements like `ximagesrc` use Xlib (C library) internally. Xlib has
+/// TWO error handlers that can call `exit()`:
+///
+/// 1. **XSetErrorHandler** — protocol errors (BadWindow, BadMatch, etc.)
+///    Default handler prints error and calls `exit(1)`.
+///
+/// 2. **XSetIOErrorHandler** — fatal IO errors (connection lost/broken pipe)
+///    Default handler prints "XIO: fatal IO error" and calls `_exit(1)`.
+///    This fires when Xvfb is killed for resize while GStreamer still has
+///    an open Xlib connection.
+///
+/// We replace both with handlers that log warnings instead of crashing.
 fn install_xlib_error_handler() {
-    // Xlib FFI — minimal declarations for XSetErrorHandler.
-    // We only need the error handler; GStreamer already links libX11.
     #[repr(C)]
     #[allow(non_camel_case_types)]
     struct XErrorEvent {
@@ -310,10 +336,12 @@ fn install_xlib_error_handler() {
 
     type XErrorHandler =
         Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut XErrorEvent) -> i32>;
+    type XIOErrorHandler = Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32>;
 
     #[link(name = "X11")]
     unsafe extern "C" {
         fn XSetErrorHandler(handler: XErrorHandler) -> XErrorHandler;
+        fn XSetIOErrorHandler(handler: XIOErrorHandler) -> XIOErrorHandler;
     }
 
     unsafe extern "C" fn non_fatal_error_handler(
@@ -330,13 +358,25 @@ fn install_xlib_error_handler() {
             event.request_code,
             event.resourceid,
         );
-        0 // Return 0 — do NOT call exit()
+        0
+    }
+
+    unsafe extern "C" fn non_fatal_io_error_handler(
+        _display: *mut std::ffi::c_void,
+    ) -> i32 {
+        // This fires when the X connection breaks (e.g., Xvfb killed for resize).
+        // The default handler calls _exit(1). We log and return 0 instead.
+        // Note: after an IO error, the Xlib Display is broken and cannot be used.
+        // GStreamer will see errors on subsequent operations and handle cleanup.
+        tracing::warn!("X11 IO error (non-fatal): display connection lost, will reconnect");
+        0
     }
 
     unsafe {
         XSetErrorHandler(Some(non_fatal_error_handler));
+        XSetIOErrorHandler(Some(non_fatal_io_error_handler));
     }
-    info!("Installed non-fatal Xlib error handler");
+    info!("Installed non-fatal Xlib error and IO error handlers");
 }
 
 /// Resolves on SIGTERM or Ctrl-C.
