@@ -1,0 +1,12 @@
+{
+  "name": "phantom-screen-e2e-browser",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npx playwright test",
+    "install-browser": "npx playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}
