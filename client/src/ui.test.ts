@@ -27,6 +27,7 @@ function createMockUI(): UIElements {
     keyframeBtn: document.createElement('button'),
     statusBar: document.createElement('div'),
     toolbar: document.createElement('div'),
+    coherenceBtn: document.createElement('button') as HTMLButtonElement,
   };
 }
 

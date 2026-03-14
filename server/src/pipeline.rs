@@ -144,24 +144,10 @@ pub fn start_pipeline(
     Ok((rx, controller))
 }
 
-pub(crate) fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {
-    let display = &config.display;
-    let fps = config.fps;
-    let bitrate = config.bitrate;
-    let ki = config.keyframe_interval;
-
-    // Insert a scale step if stream resolution differs from desktop resolution
-    let scale_part = {
-        let sw = config.stream_resolution_width();
-        let sh = config.stream_resolution_height();
-        if sw != config.resolution_width() || sh != config.resolution_height() {
-            format!("! videoscale ! video/x-raw,width={sw},height={sh} ")
-        } else {
-            String::new()
-        }
-    };
-
-    let encoder_part = match encoder_type {
+/// Build the encoder portion of a GStreamer pipeline string.
+/// Shared between full-desktop and per-window pipelines.
+pub(crate) fn build_encoder_string(encoder_type: EncoderType, bitrate: u32, ki: u32) -> String {
+    match encoder_type {
         EncoderType::X264 => {
             format!(
                 "videoconvert ! video/x-raw,format=I420 ! \
@@ -181,12 +167,49 @@ pub(crate) fn build_pipeline_string(config: &Config, encoder_type: EncoderType) 
                  bitrate={bitrate} keyframe-period={ki}"
             )
         }
+    }
+}
+
+pub(crate) fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {
+    let display = &config.display;
+    let fps = config.fps;
+
+    // Insert a scale step if stream resolution differs from desktop resolution
+    let scale_part = {
+        let sw = config.stream_resolution_width();
+        let sh = config.stream_resolution_height();
+        if sw != config.resolution_width() || sh != config.resolution_height() {
+            format!("! videoscale ! video/x-raw,width={sw},height={sh} ")
+        } else {
+            String::new()
+        }
     };
+
+    let encoder_part = build_encoder_string(encoder_type, config.bitrate, config.keyframe_interval);
 
     format!(
         "ximagesrc display-name={display} use-damage=0 show-pointer=true \
          ! video/x-raw,framerate={fps}/1 \
          {scale_part}\
+         ! {encoder_part} \
+         ! video/x-h264,stream-format=byte-stream,alignment=au \
+         ! appsink name=sink emit-signals=true sync=false"
+    )
+}
+
+/// Build a GStreamer pipeline string for capturing a specific X11 window by its xid.
+pub(crate) fn build_window_pipeline_string(
+    display: &str,
+    window_id: u32,
+    fps: u32,
+    bitrate: u32,
+    keyframe_interval: u32,
+    encoder_type: EncoderType,
+) -> String {
+    let encoder_part = build_encoder_string(encoder_type, bitrate, keyframe_interval);
+    format!(
+        "ximagesrc display-name={display} xid={window_id} use-damage=0 show-pointer=true \
+         ! video/x-raw,framerate={fps}/1 \
          ! {encoder_part} \
          ! video/x-h264,stream-format=byte-stream,alignment=au \
          ! appsink name=sink emit-signals=true sync=false"
@@ -213,6 +236,9 @@ mod tests {
             jwt_secret: None,
             post_start_command: None,
             stream_resolution: None,
+            launch_apps: "xterm,firefox".into(),
+            window_bitrate: 2000,
+            max_window_pipelines: 8,
         }
     }
 

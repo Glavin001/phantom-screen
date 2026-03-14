@@ -1,10 +1,13 @@
 #![allow(dead_code)]
 
 mod auth;
+mod coherence;
 mod config;
 mod control;
 mod input;
 mod pipeline;
+mod window_monitor;
+mod window_pipeline;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -72,6 +75,53 @@ async fn main() -> Result<()> {
     let input_handler =
         Arc::new(InputHandler::new(&config.display).context("Failed to create input handler")?);
 
+    // Initialize coherence mode support (window monitor + pipeline manager)
+    let coherence_state = {
+        let (window_rx, tracked_windows, _monitor_handle) = window_monitor::start_window_monitor(&config.display)
+            .context("Failed to start window monitor")?;
+        // The monitor handle is moved into a leaked box so it lives for the process lifetime.
+        // This is fine since we shut down via process exit.
+        let _handle = Box::leak(Box::new(_monitor_handle));
+
+        let (window_event_tx, _) = broadcast::channel::<window_monitor::WindowEvent>(256);
+
+        // Forward window monitor events to the broadcast channel
+        let tx_clone = window_event_tx.clone();
+        tokio::spawn(async move {
+            let mut rx = window_rx;
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let _ = tx_clone.send(event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Window event forwarder lagged by {} events", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("Window monitor closed");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let pipeline_manager = Arc::new(tokio::sync::Mutex::new(
+            window_pipeline::WindowPipelineManager::new(&config),
+        ));
+        let window_manager = Arc::new(
+            window_monitor::WindowManager::new(&config.display)
+                .context("Failed to create window manager")?,
+        );
+
+        Arc::new(coherence::CoherenceState {
+            window_events: window_event_tx,
+            tracked_windows,
+            pipeline_manager,
+            window_manager,
+        })
+    };
+    info!("Coherence mode support initialized");
+
     // Build WebTransport server config
     let identity = if let (Some(cert_path), Some(key_path)) = (&config.cert, &config.key) {
         wtransport::Identity::load_pemfiles(cert_path, key_path)
@@ -111,8 +161,19 @@ async fn main() -> Result<()> {
     let http_addr = SocketAddr::new(config.listen.ip(), config.listen.port() + 1);
     let client_dir = config.client_dir.clone();
     let pc_for_http = pipeline_controller.clone();
+    let launch_apps_json = {
+        let apps = config.launch_app_list();
+        format!(
+            "[{}]",
+            apps.iter()
+                .map(|a| format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(http_addr, client_dir, pc_for_http).await {
+        if let Err(e) = run_http_server(http_addr, client_dir, pc_for_http, launch_apps_json).await
+        {
             error!("HTTP server error: {}", e);
         }
     });
@@ -185,9 +246,10 @@ async fn main() -> Result<()> {
                 };
                 let pc = pipeline_controller.clone();
                 let ih = input_handler.clone();
+                let cs = coherence_state.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_session(session, frame_rx, pc, ih).await {
+                    if let Err(e) = handle_session(session, frame_rx, pc, ih, cs).await {
                         warn!("Session ended: {}", e);
                     }
                 });
@@ -229,6 +291,7 @@ async fn handle_session(
     frame_rx: Option<broadcast::Receiver<EncodedFrame>>,
     pipeline_controller: Arc<pipeline::PipelineController>,
     input_handler: Arc<InputHandler>,
+    coherence_state: Arc<coherence::CoherenceState>,
 ) -> Result<()> {
     info!("Client connected");
 
@@ -258,18 +321,33 @@ async fn handle_session(
         });
     }
 
+    // Per-session coherence state (lazily initialized on EnableCoherence)
+    let coherence_session: Arc<tokio::sync::Mutex<Option<coherence::CoherenceSession>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
     // Handle bidirectional streams for input
     loop {
         match session.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let ih = input_handler.clone();
                 let pc = pipeline_controller.clone();
+                let cs = coherence_state.clone();
+                let cs_session = coherence_session.clone();
+                let session_for_input = session.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     loop {
                         match recv.read(&mut buf).await {
                             Ok(Some(n)) if n > 0 => {
-                                process_input_data(&buf[..n], &ih, &pc);
+                                process_input_data_with_coherence(
+                                    &buf[..n],
+                                    &ih,
+                                    &pc,
+                                    &cs,
+                                    &cs_session,
+                                    &session_for_input,
+                                )
+                                .await;
                             }
                             Ok(_) => break,
                             Err(e) => {
@@ -284,6 +362,10 @@ async fn handle_session(
             }
             Err(e) => {
                 info!("Session closed: {}", e);
+                // Clean up coherence session
+                if let Some(mut cs) = coherence_session.lock().await.take() {
+                    cs.cleanup();
+                }
                 return Ok(());
             }
         }
@@ -309,6 +391,220 @@ async fn send_video_frame(session: &wtransport::Connection, frame: &EncodedFrame
     stream.finish().await?;
 
     Ok(())
+}
+
+async fn process_input_data_with_coherence(
+    data: &[u8],
+    input_handler: &InputHandler,
+    pipeline_controller: &Arc<pipeline::PipelineController>,
+    coherence_state: &Arc<coherence::CoherenceState>,
+    coherence_session: &Arc<tokio::sync::Mutex<Option<coherence::CoherenceSession>>>,
+    session: &Arc<wtransport::Connection>,
+) {
+    let mut offset = 0;
+    while offset < data.len() {
+        let remaining = &data[offset..];
+        let event_len = estimate_event_length(remaining);
+        if event_len == 0 || offset + event_len > data.len() {
+            break;
+        }
+
+        if let Some(event) = parse_input_event(&remaining[..event_len]) {
+            match &event {
+                InputEvent::EnableCoherence => {
+                    let mut cs_lock = coherence_session.lock().await;
+                    if cs_lock.is_none() {
+                        let cs = coherence::CoherenceSession::new(coherence_state);
+                        *cs_lock = Some(cs);
+                        info!("Coherence mode enabled for session");
+
+                        // Send a fresh snapshot of current windows immediately
+                        let snapshot = coherence_state.current_snapshot();
+                        let snapshot_data = coherence::serialize_window_event(&snapshot);
+                        let session_for_snapshot = session.clone();
+                        tokio::spawn(async move {
+                            if let Ok(stream_future) = session_for_snapshot.open_uni().await {
+                                if let Ok(mut stream) = stream_future.await {
+                                    let _ = stream.write_all(&snapshot_data).await;
+                                    let _ = stream.finish().await;
+                                }
+                            }
+                        });
+
+                        // Start forwarding future window events to the client
+                        let events_rx = coherence_state.window_events.subscribe();
+                        let session_clone = session.clone();
+                        tokio::spawn(async move {
+                            forward_window_events(events_rx, session_clone).await;
+                        });
+                    }
+                }
+                InputEvent::DisableCoherence => {
+                    let mut cs_lock = coherence_session.lock().await;
+                    if let Some(mut cs) = cs_lock.take() {
+                        cs.cleanup();
+                        info!("Coherence mode disabled for session");
+                    }
+                }
+                InputEvent::SubscribeWindow { window_id } => {
+                    let mut cs_lock = coherence_session.lock().await;
+                    if let Some(ref mut cs) = *cs_lock {
+                        let wid = *window_id;
+                        match cs.subscribe_window(wid).await {
+                            Ok(mut rx) => {
+                                let session_clone = session.clone();
+                                let handle = tokio::spawn(async move {
+                                    info!("Window {} sender task STARTED", wid);
+                                    let mut seen_keyframe = false;
+                                    let mut frame_count: u64 = 0;
+                                    let mut delta_skip_count: u64 = 0;
+                                    loop {
+                                        match rx.recv().await {
+                                            Ok(frame) => {
+                                                // Keyframe gating: skip delta frames until first keyframe.
+                                                if !seen_keyframe {
+                                                    if frame.is_keyframe {
+                                                        seen_keyframe = true;
+                                                        info!("Window {} sender: first keyframe ({} bytes), skipped {} deltas", wid, frame.data.len(), delta_skip_count);
+                                                    } else {
+                                                        delta_skip_count += 1;
+                                                        if delta_skip_count <= 3 {
+                                                            info!("Window {} sender: skipping delta #{} ({} bytes)", wid, delta_skip_count, frame.data.len());
+                                                        }
+                                                        continue;
+                                                    }
+                                                }
+                                                frame_count += 1;
+                                                if frame_count <= 5 {
+                                                    info!("Window {} sender frame #{}: {} bytes, keyframe={}", wid, frame_count, frame.data.len(), frame.is_keyframe);
+                                                }
+                                                if let Err(e) = coherence::send_window_video_frame(
+                                                    &session_clone,
+                                                    wid,
+                                                    &frame,
+                                                )
+                                                .await
+                                                {
+                                                    warn!(
+                                                        "Window {} sender: SEND FAILED: {}",
+                                                        wid, e
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                                warn!(
+                                                    "Window {} sender: LAGGED by {}, resetting keyframe gate",
+                                                    wid, n
+                                                );
+                                                seen_keyframe = false;
+                                            }
+                                            Err(broadcast::error::RecvError::Closed) => {
+                                                info!("Window {} sender: channel CLOSED", wid);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    info!("Window {} sender task ENDED (sent {} frames)", wid, frame_count);
+                                });
+                                cs.track_sender(wid, handle);
+                            }
+                            Err(e) => {
+                                warn!("Failed to subscribe to window {}: {}", wid, e);
+                            }
+                        }
+                    }
+                }
+                InputEvent::UnsubscribeWindow { window_id } => {
+                    let mut cs_lock = coherence_session.lock().await;
+                    if let Some(ref mut cs) = *cs_lock {
+                        cs.unsubscribe_window(*window_id).await;
+                    }
+                }
+                InputEvent::ResizeWindow {
+                    window_id,
+                    width,
+                    height,
+                } => {
+                    let cs_lock = coherence_session.lock().await;
+                    if let Some(ref cs) = *cs_lock {
+                        if let Err(e) = cs.resize_window(*window_id, *width, *height) {
+                            warn!("Failed to resize window {}: {}", window_id, e);
+                        }
+                    }
+                }
+                InputEvent::FocusWindow { window_id } => {
+                    let cs_lock = coherence_session.lock().await;
+                    if let Some(ref cs) = *cs_lock {
+                        if let Err(e) = cs.focus_window(*window_id) {
+                            warn!("Failed to focus window {}: {}", window_id, e);
+                        }
+                    }
+                }
+                InputEvent::CloseWindow { window_id } => {
+                    let cs_lock = coherence_session.lock().await;
+                    if let Some(ref cs) = *cs_lock {
+                        if let Err(e) = cs.close_window(*window_id) {
+                            warn!("Failed to close window {}: {}", window_id, e);
+                        }
+                    }
+                }
+                InputEvent::LaunchApp { command } => {
+                    info!("Launching app: {}", command);
+                    let _ = std::process::Command::new("sh")
+                        .args(["-c", command])
+                        .spawn();
+                }
+                _ => {
+                    // Regular input events - dispatch normally
+                    if let Err(e) = dispatch_event(&event, input_handler, pipeline_controller) {
+                        warn!("Failed to dispatch input event: {}", e);
+                    }
+                }
+            }
+        }
+
+        offset += event_len;
+    }
+}
+
+/// Forward window events from the monitor to the client via a unidirectional stream.
+async fn forward_window_events(
+    mut rx: broadcast::Receiver<window_monitor::WindowEvent>,
+    session: Arc<wtransport::Connection>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let data = coherence::serialize_window_event(&event);
+                match session.open_uni().await {
+                    Ok(stream_future) => match stream_future.await {
+                        Ok(mut stream) => {
+                            if let Err(e) = stream.write_all(&data).await {
+                                warn!("Failed to send window event: {}", e);
+                                break;
+                            }
+                            let _ = stream.finish().await;
+                        }
+                        Err(e) => {
+                            warn!("Failed to open uni stream for window event: {}", e);
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to open uni stream: {}", e);
+                        break;
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("Window event sender lagged by {} events", n);
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
+    }
 }
 
 fn process_input_data(
@@ -352,6 +648,15 @@ fn dispatch_event(
         | InputEvent::SetResolution { .. } => {
             control::handle_control_event(event, pipeline_controller);
         }
+        // Coherence events are handled in process_input_data_with_coherence
+        InputEvent::EnableCoherence
+        | InputEvent::DisableCoherence
+        | InputEvent::SubscribeWindow { .. }
+        | InputEvent::UnsubscribeWindow { .. }
+        | InputEvent::ResizeWindow { .. }
+        | InputEvent::FocusWindow { .. }
+        | InputEvent::CloseWindow { .. }
+        | InputEvent::LaunchApp { .. } => {}
     }
     Ok(())
 }
@@ -407,6 +712,7 @@ async fn run_http_server(
     addr: SocketAddr,
     client_dir: String,
     pipeline_controller: Arc<pipeline::PipelineController>,
+    launch_apps_json: String,
 ) -> Result<()> {
     use hyper::body::Incoming;
     use hyper::{Request, Response};
@@ -421,13 +727,27 @@ async fn run_http_server(
         let (stream, _) = listener.accept().await?;
         let client_dir = client_dir.clone();
         let pc = pipeline_controller.clone();
+        let apps_json = launch_apps_json.clone();
 
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let client_dir = client_dir.clone();
                 let pc = pc.clone();
+                let apps_json = apps_json.clone();
                 async move {
                     let path = req.uri().path();
+
+                    // Launch apps API endpoint
+                    if path == "/api/launch-apps" {
+                        return Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(200)
+                                .header("Content-Type", "application/json")
+                                .header("Access-Control-Allow-Origin", "*")
+                                .body(http_body_util::Full::new(bytes::Bytes::from(apps_json)))
+                                .unwrap(),
+                        );
+                    }
 
                     // Health/readiness endpoint
                     if path == "/health" {
@@ -582,7 +902,12 @@ mod tests {
             let bound_addr = listener.local_addr().unwrap();
             drop(listener); // Release so run_http_server can bind
 
-            tokio::spawn(run_http_server(bound_addr, client_dir, pc));
+            tokio::spawn(run_http_server(
+                bound_addr,
+                client_dir,
+                pc,
+                r#"["xterm","firefox"]"#.into(),
+            ));
 
             // Give it time to bind
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -638,7 +963,12 @@ mod tests {
             let bound_addr = listener.local_addr().unwrap();
             drop(listener);
 
-            tokio::spawn(run_http_server(bound_addr, client_dir, pc));
+            tokio::spawn(run_http_server(
+                bound_addr,
+                client_dir,
+                pc,
+                r#"["xterm","firefox"]"#.into(),
+            ));
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             use hyper_util::rt::TokioIo;

@@ -100,6 +100,83 @@ export function encodeResolutionRequest(width: number, height: number): Uint8Arr
   return buf;
 }
 
+// ── Coherence mode protocol (0x40 prefix) ────────────────────────────
+
+/** Enable coherence mode */
+export function encodeEnableCoherence(): Uint8Array {
+  return new Uint8Array([0x40, 0x01]);
+}
+
+/** Disable coherence mode */
+export function encodeDisableCoherence(): Uint8Array {
+  return new Uint8Array([0x40, 0x02]);
+}
+
+/** Subscribe to a window's video stream */
+export function encodeSubscribeWindow(windowId: number): Uint8Array {
+  const buf = new Uint8Array(6);
+  const view = new DataView(buf.buffer);
+  buf[0] = 0x40;
+  buf[1] = 0x03;
+  view.setUint32(2, windowId, false);
+  return buf;
+}
+
+/** Unsubscribe from a window's video stream */
+export function encodeUnsubscribeWindow(windowId: number): Uint8Array {
+  const buf = new Uint8Array(6);
+  const view = new DataView(buf.buffer);
+  buf[0] = 0x40;
+  buf[1] = 0x04;
+  view.setUint32(2, windowId, false);
+  return buf;
+}
+
+/** Resize a remote window */
+export function encodeResizeWindow(windowId: number, width: number, height: number): Uint8Array {
+  const buf = new Uint8Array(10);
+  const view = new DataView(buf.buffer);
+  buf[0] = 0x40;
+  buf[1] = 0x05;
+  view.setUint32(2, windowId, false);
+  view.setUint16(6, width, false);
+  view.setUint16(8, height, false);
+  return buf;
+}
+
+/** Focus/raise a remote window */
+export function encodeFocusWindow(windowId: number): Uint8Array {
+  const buf = new Uint8Array(6);
+  const view = new DataView(buf.buffer);
+  buf[0] = 0x40;
+  buf[1] = 0x06;
+  view.setUint32(2, windowId, false);
+  return buf;
+}
+
+/** Close a remote window */
+export function encodeCloseWindow(windowId: number): Uint8Array {
+  const buf = new Uint8Array(6);
+  const view = new DataView(buf.buffer);
+  buf[0] = 0x40;
+  buf[1] = 0x07;
+  view.setUint32(2, windowId, false);
+  return buf;
+}
+
+/** Launch an application on the remote desktop */
+export function encodeLaunchApp(command: string): Uint8Array {
+  const encoder = new TextEncoder();
+  const cmdBytes = encoder.encode(command);
+  const buf = new Uint8Array(4 + cmdBytes.length);
+  const view = new DataView(buf.buffer);
+  buf[0] = 0x40;
+  buf[1] = 0x08;
+  view.setUint16(2, cmdBytes.length, false);
+  buf.set(cmdBytes, 4);
+  return buf;
+}
+
 /**
  * Attach input event listeners to the canvas element.
  * Returns a cleanup function to remove listeners.
