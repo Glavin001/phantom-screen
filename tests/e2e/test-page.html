@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Phantom Screen E2E Test</title>
+  <style>
+    #screen { width: 100%; height: 600px; }
+    #status { font-family: monospace; padding: 10px; }
+  </style>
+</head>
+<body>
+  <div id="status">Loading...</div>
+  <div id="screen"></div>
+  <script src="/phantom-screen-client.iife.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const serverUrl = params.get('serverUrl') || 'https://127.0.0.1:4443';
+    const certHash = params.get('certHash') || '';
+    const transport = params.get('transport') || 'auto';
+
+    const statusEl = document.getElementById('status');
+
+    const client = PhantomScreenClient.mountPhantomScreen(
+      document.getElementById('screen'),
+      {
+        serverUrl,
+        serverCertificateHash: certHash || undefined,
+        useShadowDom: false,
+        transport,
+        onStateChange: (state, message) => {
+          statusEl.textContent = `${state}: ${message}`;
+          statusEl.setAttribute('data-state', state);
+        },
+      }
+    );
+
+    // Expose client for Playwright to interact with
+    window.__phantomClient = client;
+    statusEl.textContent = 'ready: SDK mounted';
+    statusEl.setAttribute('data-state', 'ready');
+  </script>
+</body>
+</html>

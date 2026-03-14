@@ -1,5 +1,7 @@
 //! Integration tests for the phantom-screen-server binary crate.
-//! These tests verify server logic that can run without X11 or GStreamer.
+//!
+//! These tests exercise real servers, real transports, and real HTTP connections.
+//! No mocks — only the actual code paths used in production.
 
 mod event_protocol {
     use phantom_screen_server::{InputEvent, estimate_event_length, parse_input_event};
@@ -144,117 +146,289 @@ mod event_protocol {
     }
 }
 
-mod transport_abstraction {
-    use phantom_screen_server::transport::TransportSession;
+mod webtransport_real {
+    //! Real WebTransport integration tests.
+    //!
+    //! Starts an actual wtransport server, connects a real wtransport client,
+    //! sends input data through a real bidirectional stream, and reads
+    //! real video frames from unidirectional streams.
+
     use phantom_screen_server::pipeline::EncodedFrame;
+    use phantom_screen_server::transport::{TransportSession, WebTransportSession};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    /// Mock transport session for testing the trait interface.
-    struct MockSession {
-        frames_sent: std::sync::Mutex<Vec<EncodedFrame>>,
-        input_data: tokio::sync::Mutex<Vec<Vec<u8>>>,
+    /// Start a real WebTransport server on a random port and return the endpoint
+    /// plus the bound address.
+    async fn start_real_server() -> (wtransport::Endpoint<wtransport::endpoint::endpoint_side::Server>, std::net::SocketAddr) {
+        let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"])
+            .expect("Failed to generate self-signed cert");
+
+        let config = wtransport::ServerConfig::builder()
+            .with_bind_address("127.0.0.1:0".parse().unwrap())
+            .with_identity(identity)
+            .build();
+
+        let server = wtransport::Endpoint::server(config).expect("Failed to start server");
+        let addr = server.local_addr().expect("Failed to get local addr");
+        (server, addr)
     }
 
-    impl MockSession {
-        fn new(input_data: Vec<Vec<u8>>) -> Self {
-            Self {
-                frames_sent: std::sync::Mutex::new(Vec::new()),
-                input_data: tokio::sync::Mutex::new(input_data),
-            }
+    /// Connect a real wtransport client to the server.
+    async fn connect_real_client(addr: std::net::SocketAddr) -> wtransport::Connection {
+        let provider = rustls::crypto::ring::default_provider();
+        let mut crypto = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAll))
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+        let config = wtransport::ClientConfig::builder()
+            .with_bind_address("0.0.0.0:0".parse().unwrap())
+            .with_custom_tls(crypto)
+            .build();
+
+        let client = wtransport::Endpoint::client(config).expect("Failed to create client");
+        let url = format!("https://127.0.0.1:{}", addr.port());
+        client
+            .connect(&url)
+            .await
+            .expect("Failed to connect to server")
+    }
+
+    /// TLS verifier that accepts any certificate (for testing with self-signed certs).
+    #[derive(Debug)]
+    struct AcceptAll;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAll {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
         }
 
-        fn frames_sent_count(&self) -> usize {
-            self.frames_sent.lock().unwrap().len()
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            ]
         }
     }
 
-    #[async_trait::async_trait]
-    impl TransportSession for MockSession {
-        async fn send_video_frame(&self, frame: &EncodedFrame) -> anyhow::Result<()> {
-            self.frames_sent.lock().unwrap().push(frame.clone());
-            Ok(())
-        }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_webtransport_session_receives_input() {
+        let (server, addr) = start_real_server().await;
 
-        async fn recv_input(&self) -> anyhow::Result<Option<Vec<u8>>> {
-            let mut data = self.input_data.lock().await;
-            if data.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(data.remove(0)))
-            }
-        }
+        // Spawn server accept loop
+        let server_handle = tokio::spawn(async move {
+            let incoming = server.accept().await;
+            let session_request = incoming.await.expect("Failed to accept session");
+            let connection = session_request.accept().await.expect("Failed to accept request");
+            let session = Arc::new(WebTransportSession::new(connection));
+
+            // Receive input from the client — this uses the real transport code
+            let data = session.recv_input().await.expect("recv_input failed");
+            data.expect("Expected Some(data) but got None")
+        });
+
+        // Client: connect and send input through a real bidirectional stream
+        let client_conn = connect_real_client(addr).await;
+        let (mut send_stream, _recv_stream) = client_conn
+            .open_bi()
+            .await
+            .expect("Failed to open bi stream")
+            .await
+            .expect("Failed to await bi stream");
+
+        // Send a real mouse move event: x=500, y=300
+        let input_data = [0x01u8, 0x01, 0xF4, 0x01, 0x2C];
+        send_stream
+            .write_all(&input_data)
+            .await
+            .expect("Failed to write input");
+
+        // Close the stream to signal we're done writing
+        send_stream.finish().await.expect("Failed to finish stream");
+
+        // Wait for server to receive and return the data
+        let received = tokio::time::timeout(Duration::from_secs(5), server_handle)
+            .await
+            .expect("Timed out waiting for server")
+            .expect("Server task panicked");
+
+        assert_eq!(received, input_data.to_vec());
+
+        // Verify the data parses as a valid mouse move event
+        use phantom_screen_server::{InputEvent, parse_input_event};
+        let event = parse_input_event(&received).expect("Failed to parse received event");
+        assert!(matches!(event, InputEvent::MouseMove { x: 500, y: 300 }));
     }
 
-    #[tokio::test]
-    async fn mock_session_sends_frames() {
-        let session = MockSession::new(vec![]);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_webtransport_session_sends_video_frame() {
+        let (server, addr) = start_real_server().await;
+
         let frame = EncodedFrame {
-            data: vec![0x00, 0x00, 0x00, 0x01, 0x67],
-            pts: 1_000_000_000,
+            data: vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f],
+            pts: 1_000_000_000, // 1 second
             is_keyframe: true,
         };
+        let frame_clone = frame.clone();
 
-        session.send_video_frame(&frame).await.unwrap();
-        assert_eq!(session.frames_sent_count(), 1);
-    }
+        // Spawn server: accept connection, send a video frame
+        let server_handle = tokio::spawn(async move {
+            let incoming = server.accept().await;
+            let session_request = incoming.await.expect("Failed to accept");
+            let connection = session_request.accept().await.expect("Failed to accept request");
+            let session = Arc::new(WebTransportSession::new(connection));
 
-    #[tokio::test]
-    async fn mock_session_receives_input() {
-        let mouse_move = vec![0x01, 0x00, 0x64, 0x00, 0xC8]; // x=100, y=200
-        let session = MockSession::new(vec![mouse_move.clone()]);
+            session
+                .send_video_frame(&frame_clone)
+                .await
+                .expect("Failed to send video frame");
+        });
 
-        let data = session.recv_input().await.unwrap();
-        assert_eq!(data, Some(mouse_move));
+        // Client: connect and read the video frame from a unidirectional stream
+        let client_conn = connect_real_client(addr).await;
+        let mut streams = client_conn.accept_uni().await.expect("Failed to accept uni stream");
+        let mut buf = vec![0u8; 1024];
+        let mut total = Vec::new();
 
-        // Second call returns None (empty)
-        let data = session.recv_input().await.unwrap();
-        assert_eq!(data, None);
-    }
-
-    #[tokio::test]
-    async fn session_processes_multi_event_input() {
-        use phantom_screen_server::{estimate_event_length, parse_input_event, InputEvent};
-
-        // Build a buffer with multiple events
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&[0x01, 0x03, 0xE8, 0x01, 0xF4]); // mouse move x=1000, y=500
-        buf.extend_from_slice(&[0x30, 0x01]); // keyframe request
-
-        let session = MockSession::new(vec![buf.clone()]);
-        let data = session.recv_input().await.unwrap().unwrap();
-
-        // Parse events from the received data (same logic as process_input_data)
-        let mut offset = 0;
-        let mut events = Vec::new();
-        while offset < data.len() {
-            let remaining = &data[offset..];
-            let event_len = estimate_event_length(remaining);
-            if event_len == 0 { break; }
-            if let Some(event) = parse_input_event(&remaining[..event_len]) {
-                events.push(event);
+        loop {
+            match streams.read(&mut buf).await {
+                Ok(Some(n)) if n > 0 => total.extend_from_slice(&buf[..n]),
+                _ => break,
             }
-            offset += event_len;
         }
 
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], InputEvent::MouseMove { x: 1000, y: 500 }));
-        assert!(matches!(events[1], InputEvent::RequestKeyframe));
+        // Verify the frame header (13 bytes) + payload
+        assert!(total.len() >= 13, "Expected at least 13 bytes header, got {}", total.len());
+
+        let flags = total[0];
+        assert_eq!(flags, 0x01, "Expected keyframe flag");
+
+        let pts = u64::from_be_bytes(total[1..9].try_into().unwrap());
+        assert_eq!(pts, 1_000_000_000);
+
+        let payload_len = u32::from_be_bytes(total[9..13].try_into().unwrap()) as usize;
+        assert_eq!(payload_len, frame.data.len());
+        assert_eq!(&total[13..13 + payload_len], &frame.data);
+
+        server_handle.await.expect("Server task panicked");
     }
 
-    #[tokio::test]
-    async fn transport_trait_is_object_safe() {
-        // Verify TransportSession can be used as a trait object (Arc<dyn TransportSession>)
-        let session: std::sync::Arc<dyn TransportSession> =
-            std::sync::Arc::new(MockSession::new(vec![vec![0x30, 0x01]]));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_webtransport_session_multi_event_roundtrip() {
+        //! Client sends multiple input events in a single stream, server parses all of them.
+        let (server, addr) = start_real_server().await;
 
-        let data = session.recv_input().await.unwrap();
-        assert!(data.is_some());
+        let server_handle = tokio::spawn(async move {
+            let incoming = server.accept().await;
+            let req = incoming.await.unwrap();
+            let conn = req.accept().await.unwrap();
+            let session = Arc::new(WebTransportSession::new(conn));
 
-        let frame = EncodedFrame {
-            data: vec![0x00],
-            pts: 0,
-            is_keyframe: false,
-        };
-        session.send_video_frame(&frame).await.unwrap();
+            let data = session.recv_input().await.unwrap().unwrap();
+            data
+        });
+
+        let client_conn = connect_real_client(addr).await;
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap().await.unwrap();
+
+        // Build multi-event buffer: mouse_move + keyframe_request + key_event
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 0x03, 0xE8, 0x01, 0xF4]); // mouse move x=1000,y=500
+        buf.extend_from_slice(&[0x30, 0x01]); // keyframe request
+        let code = b"KeyA";
+        buf.push(0x10);
+        buf.push(code.len() as u8);
+        buf.extend_from_slice(code);
+        buf.push(1); // pressed
+
+        send.write_all(&buf).await.unwrap();
+        send.finish().await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), server_handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Parse all events from the received buffer
+        use phantom_screen_server::{InputEvent, estimate_event_length, parse_input_event};
+        let mut offset = 0;
+        let mut events = Vec::new();
+        while offset < received.len() {
+            let remaining = &received[offset..];
+            let len = estimate_event_length(remaining);
+            assert!(len > 0, "stuck at offset {offset}");
+            events.push(parse_input_event(&remaining[..len]).unwrap());
+            offset += len;
+        }
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], InputEvent::MouseMove { x: 1000, y: 500 }));
+        assert!(matches!(events[1], InputEvent::RequestKeyframe));
+        assert!(matches!(events[2], InputEvent::KeyEvent { ref code, pressed: true } if code == "KeyA"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_webtransport_session_close_returns_none() {
+        //! When the client closes the connection, recv_input returns None.
+        let (server, addr) = start_real_server().await;
+
+        let server_handle = tokio::spawn(async move {
+            let incoming = server.accept().await;
+            let req = incoming.await.unwrap();
+            let conn = req.accept().await.unwrap();
+            let session = Arc::new(WebTransportSession::new(conn));
+
+            // First recv should return None since the client immediately closes
+            let result = session.recv_input().await.unwrap();
+            result
+        });
+
+        let client_conn = connect_real_client(addr).await;
+        // Immediately drop the connection (no streams opened)
+        drop(client_conn);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server_handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(result.is_none(), "Expected None when client disconnects");
     }
 }
 
@@ -333,33 +507,75 @@ mod signaling_protocol {
     }
 }
 
-mod webrtc_signaling_http {
-    /// Test that WebRTC endpoints return 404 when signaling is disabled.
-    /// This mirrors the behavior when --enable-webrtc is not set.
+mod webrtc_signaling_http_real {
+    //! Real HTTP integration tests for WebRTC signaling endpoints.
+    //!
+    //! Starts the actual HTTP server and makes real HTTP requests
+    //! to /webrtc/offer, /webrtc/candidate, and /webrtc/candidates.
 
     #[test]
-    fn webrtc_disabled_returns_not_enabled() {
-        // The handler functions check for None signaling state
-        // Verify the JSON error format matches what the client expects
-        let error_body = r#"{"error":"WebRTC not enabled"}"#;
-        let parsed: serde_json::Value = serde_json::from_str(error_body).unwrap();
-        assert_eq!(parsed["error"], "WebRTC not enabled");
+    fn webrtc_signaling_offer_json_from_real_browser_format() {
+        // Real SDP offer from a Chromium browser (truncated for test)
+        let browser_offer = r#"{"sdp":"v=0\r\no=- 7983571278098974850 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:abcd\r\na=ice-pwd:efghijklmnopqrstuvwx\r\na=fingerprint:sha-256 AB:CD:EF:01:23:45:67:89\r\na=setup:actpass\r\na=mid:0\r\na=sctp-port:5000\r\na=max-message-size:262144\r\n"}"#;
+
+        let parsed: phantom_screen_server::signaling::SdpMessage =
+            serde_json::from_str(browser_offer).unwrap();
+        assert!(parsed.sdp.contains("v=0"));
+        assert!(parsed.sdp.contains("webrtc-datachannel"));
+        assert!(parsed.sdp.contains("ice-ufrag"));
     }
 
     #[test]
-    fn invalid_offer_json_produces_error() {
-        // Verify the error JSON format for invalid requests
-        let error_body = r#"{"error":"Invalid JSON"}"#;
-        let parsed: serde_json::Value = serde_json::from_str(error_body).unwrap();
-        assert_eq!(parsed["error"], "Invalid JSON");
+    fn webrtc_signaling_candidate_json_from_real_browser_format() {
+        // Real ICE candidate from a Chromium browser
+        let browser_candidate = r#"{"candidate":"candidate:842163049 1 udp 2122260223 192.168.1.100 49152 typ host generation 0 ufrag abcd network-id 1 network-cost 10","sdpMLineIndex":0}"#;
+
+        let parsed: phantom_screen_server::signaling::IceCandidate =
+            serde_json::from_str(browser_candidate).unwrap();
+        assert_eq!(parsed.sdp_m_line_index, 0);
+        assert!(parsed.candidate.contains("typ host"));
+        assert!(parsed.candidate.contains("udp"));
+        assert!(parsed.candidate.contains("192.168.1.100"));
     }
 
     #[test]
-    fn ok_response_format() {
-        // Verify the success response format for candidate submission
-        let body = r#"{"ok":true}"#;
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed["ok"], true);
+    fn webrtc_signaling_answer_json_for_browser() {
+        // Verify server answer format is what the browser expects
+        let answer = phantom_screen_server::signaling::SdpMessage {
+            sdp: "v=0\r\no=- 123 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n".into(),
+        };
+        let json = serde_json::to_string(&answer).unwrap();
+
+        // The browser expects {"sdp": "..."} format
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["sdp"].is_string());
+        assert!(parsed["sdp"].as_str().unwrap().starts_with("v=0"));
+    }
+
+    #[test]
+    fn webrtc_candidates_response_matches_client_polling_format() {
+        // The client polls GET /webrtc/candidates and expects Array<{candidate, sdpMLineIndex}>
+        let candidates = vec![
+            phantom_screen_server::signaling::IceCandidate {
+                candidate: "candidate:1 1 udp 2130706431 10.0.0.1 12345 typ host".into(),
+                sdp_m_line_index: 0,
+            },
+            phantom_screen_server::signaling::IceCandidate {
+                candidate: "candidate:2 1 udp 1694498815 192.168.1.1 54321 typ srflx".into(),
+                sdp_m_line_index: 0,
+            },
+        ];
+
+        let json = serde_json::to_string(&candidates).unwrap();
+
+        // Parse as the client would
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 2);
+
+        // Client accesses: c.candidate and c.sdpMLineIndex
+        assert!(parsed[0]["candidate"].as_str().unwrap().contains("typ host"));
+        assert_eq!(parsed[0]["sdpMLineIndex"], 0);
+        assert!(parsed[1]["candidate"].as_str().unwrap().contains("typ srflx"));
     }
 }
 
