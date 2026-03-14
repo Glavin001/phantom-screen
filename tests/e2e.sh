@@ -19,6 +19,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+source "$SCRIPT_DIR/docker-proxy-helper.sh"
+
 IMAGE_NAME="phantom-screen-e2e-test"
 CONTAINER_NAME="phantom-screen-e2e-$$"
 HTTP_PORT=14444
@@ -46,7 +48,7 @@ trap cleanup EXIT
 # ---- Build ----
 if [[ "${1:-}" != "--no-build" ]]; then
   echo "Building Docker image..."
-  docker build -t "$IMAGE_NAME" -f "$PROJECT_DIR/server/Dockerfile" "$PROJECT_DIR" || {
+  docker_build_proxied "$PROJECT_DIR/server/Dockerfile" -t "$IMAGE_NAME" "$PROJECT_DIR" || {
     log_fail "Docker build failed"
     exit 1
   }

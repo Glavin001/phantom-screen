@@ -557,10 +557,9 @@ fn get_window_title(conn: &RustConnection, window: xproto::Window, atoms: &Atoms
         conn.get_property(false, window, atoms.net_wm_name, atoms.utf8_string, 0, 1024)
         && let Ok(prop) = cookie.reply()
         && prop.length > 0
+        && let Ok(s) = std::str::from_utf8(&prop.value)
     {
-        if let Ok(s) = std::str::from_utf8(&prop.value) {
-            return s.to_string();
-        }
+        return s.to_string();
     }
 
     // Fallback to WM_NAME
