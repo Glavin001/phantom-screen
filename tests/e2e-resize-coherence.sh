@@ -147,23 +147,23 @@ sleep 2
 echo ""
 echo "Creating overlapping windows..."
 
-xterm -geometry 40x10+0+0 -e "echo BACK_WINDOW; sleep 3600" &
+xterm -T "BACK_WINDOW" -geometry 40x10+0+0 -e "sleep 3600" &
 PIDS+=($!)
 sleep 1
 
-xterm -geometry 40x10+50+30 -e "echo FRONT_WINDOW; sleep 3600" &
+xterm -T "FRONT_WINDOW" -geometry 40x10+50+30 -e "sleep 3600" &
 PIDS+=($!)
 sleep 1
 
-WINDOW_COUNT=$(xdotool search --name "xterm" 2>/dev/null | wc -l || echo "0")
-if [ "$WINDOW_COUNT" -ge 2 ]; then
+WINDOW_COUNT=$(xdotool search --class "XTerm" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+if [ "${WINDOW_COUNT:-0}" -ge 2 ]; then
   log_pass "Created $WINDOW_COUNT overlapping xterm windows"
 else
   log_fail "Expected >= 2 xterm windows, found $WINDOW_COUNT"
 fi
 
 # ---- Test 2: Per-window capture works before resize ----
-BACK_WID=$(xdotool search --name "xterm" 2>/dev/null | head -1 || echo "")
+BACK_WID=$(xdotool search --class "XTerm" 2>/dev/null | head -1 || echo "")
 if [ -n "$BACK_WID" ]; then
   CAPTURE_OK=$(timeout 10 gst-launch-1.0 -q \
     ximagesrc display-name="$DISPLAY_NUM" xid="$BACK_WID" use-damage=0 num-buffers=1 \
@@ -280,15 +280,15 @@ fi
 echo ""
 echo "Launching new windows on resized display..."
 
-DISPLAY="$DISPLAY_NUM" xterm -geometry 40x10+0+0 -e "echo POST_RESIZE_1; sleep 3600" &
+DISPLAY="$DISPLAY_NUM" xterm -T "POST_RESIZE_1" -geometry 40x10+0+0 -e "sleep 3600" &
 PIDS+=($!)
 sleep 1
 
-DISPLAY="$DISPLAY_NUM" xterm -geometry 40x10+50+30 -e "echo POST_RESIZE_2; sleep 3600" &
+DISPLAY="$DISPLAY_NUM" xterm -T "POST_RESIZE_2" -geometry 40x10+50+30 -e "sleep 3600" &
 PIDS+=($!)
 sleep 1
 
-NEW_WID=$(DISPLAY="$DISPLAY_NUM" xdotool search --name "xterm" 2>/dev/null | head -1 || echo "")
+NEW_WID=$(DISPLAY="$DISPLAY_NUM" xdotool search --class "XTerm" 2>/dev/null | head -1 || echo "")
 if [ -n "$NEW_WID" ]; then
   log_pass "New windows launched on resized display (wid: $NEW_WID)"
 
@@ -330,7 +330,7 @@ else
 fi
 
 # ---- Test 12: Non-fatal Xlib error handler installed ----
-if grep -q "Installed non-fatal Xlib error handler" "$SERVER_LOG" 2>/dev/null; then
+if grep -q "Installed non-fatal Xlib error" "$SERVER_LOG" 2>/dev/null; then
   log_pass "Non-fatal Xlib error handler installed"
 else
   log_fail "Non-fatal Xlib error handler not found in logs"

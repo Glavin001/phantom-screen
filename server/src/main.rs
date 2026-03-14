@@ -344,6 +344,10 @@ fn install_xlib_error_handler() {
         fn XSetIOErrorHandler(handler: XIOErrorHandler) -> XIOErrorHandler;
     }
 
+    unsafe extern "C" {
+        fn pthread_exit(retval: *mut std::ffi::c_void) -> !;
+    }
+
     unsafe extern "C" fn non_fatal_error_handler(
         _display: *mut std::ffi::c_void,
         event: *mut XErrorEvent,
@@ -365,11 +369,19 @@ fn install_xlib_error_handler() {
         _display: *mut std::ffi::c_void,
     ) -> i32 {
         // This fires when the X connection breaks (e.g., Xvfb killed for resize).
-        // The default handler calls _exit(1). We log and return 0 instead.
-        // Note: after an IO error, the Xlib Display is broken and cannot be used.
-        // GStreamer will see errors on subsequent operations and handle cleanup.
-        tracing::warn!("X11 IO error (non-fatal): display connection lost, will reconnect");
-        0
+        // We MUST NOT return — Xlib calls _exit(1) after this handler returns,
+        // regardless of the return value. This is by Xlib spec and cannot be
+        // overridden via XSetIOErrorHandler alone.
+        //
+        // Instead, we terminate just this thread via pthread_exit(). The thread
+        // hitting the IO error is a GStreamer streaming thread whose X connection
+        // is already broken. Killing it prevents process-wide _exit(1) while
+        // letting the rest of the server continue. The pipeline will detect the
+        // thread loss and be cleaned up normally.
+        tracing::warn!("X11 IO error: display connection lost, terminating thread");
+        unsafe {
+            pthread_exit(std::ptr::null_mut());
+        }
     }
 
     unsafe {
