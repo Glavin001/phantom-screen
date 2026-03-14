@@ -8,6 +8,7 @@ use std::sync::{
 use tokio::sync::{broadcast, watch};
 
 use crate::config::{Config, EncoderType, detect_encoder};
+use crate::input::InputHandler;
 
 /// Query the current resolution of an X11 display using xdpyinfo.
 ///
@@ -116,6 +117,8 @@ pub struct PipelineManager {
     encoder_type: EncoderType,
     controller: Mutex<Arc<PipelineController>>,
     frame_watch_tx: watch::Sender<broadcast::Sender<EncodedFrame>>,
+    input_handler: Option<Arc<InputHandler>>,
+    post_start_command: Option<String>,
 }
 
 impl PipelineManager {
@@ -147,7 +150,13 @@ impl PipelineManager {
             height
         );
 
-        // Resize the virtual display via xrandr
+        // Stop old pipeline first (before killing Xvfb to avoid GStreamer errors)
+        {
+            let controller = self.controller.lock().unwrap();
+            controller.stop();
+        }
+
+        // Resize the virtual display (kills and restarts Xvfb)
         resize_display(&config.display, width, height)?;
 
         // Update config
@@ -155,14 +164,26 @@ impl PipelineManager {
         // Clear stream_resolution so new pipeline captures at native size
         config.stream_resolution = None;
 
-        // Stop old pipeline
-        {
-            let controller = self.controller.lock().unwrap();
-            controller.stop();
-        }
-
         // Brief pause for X server to settle after resize
         std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Reconnect the input handler to the new X display
+        if let Some(ref ih) = self.input_handler {
+            if let Err(e) = ih.reconnect() {
+                tracing::error!("Failed to reconnect input handler after resize: {}", e);
+            }
+        }
+
+        // Restart the post-start command (e.g. xterm) since it lost its X connection
+        if let Some(ref cmd) = self.post_start_command {
+            let display = &config.display;
+            tracing::info!("Restarting post-start command after resize: {}", cmd);
+            let _ = std::process::Command::new("sh")
+                .args(["-c", cmd])
+                .env("DISPLAY", display)
+                .spawn()
+                .map_err(|e| tracing::error!("Failed to restart post-start command: {}", e));
+        }
 
         // Start new pipeline
         let (new_tx, new_controller) = start_pipeline_inner(&config, self.encoder_type)?;
@@ -273,6 +294,8 @@ impl PipelineManager {
             encoder_type: EncoderType::X264,
             controller: Mutex::new(pc),
             frame_watch_tx: watch_tx,
+            input_handler: None,
+            post_start_command: None,
         })
     }
 }
@@ -355,6 +378,8 @@ pub fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
 /// Returns a broadcast sender/receiver pair and a pipeline controller.
 pub fn start_pipeline(
     config: &Config,
+    input_handler: Option<Arc<InputHandler>>,
+    post_start_command: Option<String>,
 ) -> Result<(broadcast::Receiver<EncodedFrame>, Arc<PipelineManager>)> {
     gstreamer::init().context("Failed to init GStreamer")?;
 
@@ -369,6 +394,8 @@ pub fn start_pipeline(
         encoder_type,
         controller: Mutex::new(new_controller),
         frame_watch_tx: watch_tx,
+        input_handler,
+        post_start_command,
     });
 
     Ok((frame_rx, manager))

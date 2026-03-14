@@ -53,6 +53,10 @@ async fn main() -> Result<()> {
     // Wait for display to be ready
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Create input handler (before pipeline so it can be shared with PipelineManager)
+    let input_handler =
+        Arc::new(InputHandler::new(&config.display).context("Failed to create input handler")?);
+
     // Launch post-start command (e.g. a demo app) if configured
     if let Some(ref cmd) = config.post_start_command {
         info!("Launching post-start command: {}", cmd);
@@ -63,19 +67,19 @@ async fn main() -> Result<()> {
         children.push(child);
     }
 
-    // Start GStreamer pipeline
-    let (_frame_rx, pipeline_manager) =
-        pipeline::start_pipeline(&config).context("Failed to start pipeline")?;
+    // Start GStreamer pipeline (shares input_handler and post_start_command for resize coordination)
+    let (_frame_rx, pipeline_manager) = pipeline::start_pipeline(
+        &config,
+        Some(input_handler.clone()),
+        config.post_start_command.clone(),
+    )
+    .context("Failed to start pipeline")?;
     info!("GStreamer pipeline running");
 
     // Monitor the X display for external resolution changes (e.g. xrandr, apps)
     let pm_for_monitor = pipeline_manager.clone();
     let display_for_monitor = config.display.clone();
     pipeline::spawn_resolution_monitor(pm_for_monitor, display_for_monitor, Duration::from_secs(2));
-
-    // Create input handler
-    let input_handler =
-        Arc::new(InputHandler::new(&config.display).context("Failed to create input handler")?);
 
     // Build WebTransport server config
     let identity = if let (Some(cert_path), Some(key_path)) = (&config.cert, &config.key) {
