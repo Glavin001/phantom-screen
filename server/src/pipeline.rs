@@ -2,10 +2,10 @@ use anyhow::{Context, Result};
 use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::config::{Config, EncoderType, detect_encoder};
 
@@ -71,15 +71,261 @@ impl PipelineController {
     }
 }
 
-/// Start the GStreamer capture/encode pipeline
+/// Manages pipeline lifecycle including dynamic restarts for resolution changes.
 ///
-/// Returns a broadcast channel of encoded frames and a pipeline controller.
+/// Sessions subscribe to `frame_watch` to receive new broadcast senders whenever the
+/// pipeline restarts. On each restart the old broadcast sender is dropped (causing
+/// receivers to see `Closed`), and a new sender is published through the watch channel.
+pub struct PipelineManager {
+    config: Mutex<Config>,
+    encoder_type: EncoderType,
+    controller: Mutex<Arc<PipelineController>>,
+    frame_watch_tx: watch::Sender<broadcast::Sender<EncodedFrame>>,
+}
+
+impl PipelineManager {
+    /// Resize the display and restart the pipeline.
+    ///
+    /// 1. Calls `xrandr` to change the Xvfb resolution.
+    /// 2. Stops the current pipeline.
+    /// 3. Starts a new pipeline with the new resolution.
+    /// 4. Publishes the new broadcast sender so sessions re-subscribe.
+    pub fn resize(&self, width: u16, height: u16) -> Result<()> {
+        let mut config = self.config.lock().unwrap();
+        let current_w = config.resolution_width() as u16;
+        let current_h = config.resolution_height() as u16;
+
+        if current_w == width && current_h == height {
+            tracing::debug!(
+                "Resize requested but resolution unchanged ({}x{})",
+                width,
+                height
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Resizing display from {}x{} to {}x{}",
+            current_w,
+            current_h,
+            width,
+            height
+        );
+
+        // Resize the virtual display via xrandr
+        resize_display(&config.display, width, height)?;
+
+        // Update config
+        config.resolution = format!("{}x{}", width, height);
+        // Clear stream_resolution so new pipeline captures at native size
+        config.stream_resolution = None;
+
+        // Stop old pipeline
+        {
+            let controller = self.controller.lock().unwrap();
+            controller.stop();
+        }
+
+        // Brief pause for X server to settle after resize
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Start new pipeline
+        let (new_tx, new_controller) = start_pipeline_inner(&config, self.encoder_type)?;
+
+        // Swap in new controller
+        {
+            let mut controller = self.controller.lock().unwrap();
+            *controller = new_controller;
+        }
+
+        // Publish new broadcast sender - sessions will re-subscribe
+        let _ = self.frame_watch_tx.send(new_tx);
+
+        tracing::info!("Pipeline restarted at {}x{}", width, height);
+        Ok(())
+    }
+
+    /// Get the current pipeline controller (for keyframe/bitrate requests).
+    pub fn controller(&self) -> Arc<PipelineController> {
+        self.controller.lock().unwrap().clone()
+    }
+
+    /// Subscribe to pipeline changes. Returns a watch receiver that yields
+    /// a new broadcast::Sender each time the pipeline restarts.
+    pub fn subscribe_watch(&self) -> watch::Receiver<broadcast::Sender<EncodedFrame>> {
+        self.frame_watch_tx.subscribe()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.controller.lock().unwrap().is_running()
+    }
+
+    pub fn stop(&self) {
+        self.controller.lock().unwrap().stop();
+    }
+
+    pub fn force_keyframe(&self) {
+        self.controller.lock().unwrap().force_keyframe();
+    }
+
+    pub fn set_bitrate(&self, kbps: u32) {
+        self.controller.lock().unwrap().set_bitrate(kbps);
+    }
+
+    /// Create a dummy manager for testing (no real GStreamer pipeline or display).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(running: bool) -> Arc<Self> {
+        let pc = PipelineController::new_for_test(running);
+        let (tx, _) = broadcast::channel::<EncodedFrame>(4);
+        let (watch_tx, _) = watch::channel(tx);
+        let config = Config {
+            display: ":99".into(),
+            resolution: "1920x1080".into(),
+            listen: "0.0.0.0:4443".parse().unwrap(),
+            fps: 60,
+            bitrate: 6000,
+            keyframe_interval: 60,
+            cert: None,
+            key: None,
+            client_dir: "../client/dist/standalone".into(),
+            no_xvfb: false,
+            wm: "openbox".into(),
+            jwt_secret: None,
+            post_start_command: None,
+            stream_resolution: None,
+        };
+        Arc::new(Self {
+            config: Mutex::new(config),
+            encoder_type: EncoderType::X264,
+            controller: Mutex::new(pc),
+            frame_watch_tx: watch_tx,
+        })
+    }
+}
+
+/// Resize the Xvfb display using xrandr.
+///
+/// Attempts to add a new mode matching the requested resolution and apply it.
+/// Falls back gracefully if the mode already exists.
+fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
+    use std::process::Command;
+
+    let mode_name = format!("{}x{}", width, height);
+
+    // Try to generate modeline with cvt
+    let cvt_output = Command::new("cvt")
+        .args([&width.to_string(), &height.to_string(), "60"])
+        .env("DISPLAY", display)
+        .output()
+        .context("Failed to run cvt")?;
+
+    let cvt_str = String::from_utf8_lossy(&cvt_output.stdout);
+    // Parse the Modeline from cvt output (second line, after "Modeline")
+    let modeline = cvt_str
+        .lines()
+        .find(|l| l.contains("Modeline"))
+        .and_then(|l| l.split_once('"'))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(_, params)| params.trim().to_string());
+
+    if let Some(params) = modeline {
+        // Add new mode (ignore errors if it already exists)
+        let _ = Command::new("xrandr")
+            .args(["--newmode", &mode_name])
+            .args(params.split_whitespace())
+            .env("DISPLAY", display)
+            .output();
+
+        // Add mode to the default output
+        // Xvfb typically uses "screen" as the output name
+        let outputs = get_xrandr_output(display);
+        let output_name = outputs.unwrap_or_else(|| "screen".to_string());
+
+        let _ = Command::new("xrandr")
+            .args(["--addmode", &output_name, &mode_name])
+            .env("DISPLAY", display)
+            .output();
+
+        // Apply the mode
+        let result = Command::new("xrandr")
+            .args(["--output", &output_name, "--mode", &mode_name])
+            .env("DISPLAY", display)
+            .output()
+            .context("Failed to set xrandr mode")?;
+
+        if result.status.success() {
+            tracing::info!("xrandr: set mode {} on output {}", mode_name, output_name);
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        tracing::warn!(
+            "xrandr --mode failed: {}, trying --fb fallback",
+            stderr.trim()
+        );
+    }
+
+    // Fallback: use --fb to set framebuffer size directly
+    let result = Command::new("xrandr")
+        .args(["--fb", &format!("{}x{}", width, height)])
+        .env("DISPLAY", display)
+        .output()
+        .context("Failed to run xrandr --fb")?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        anyhow::bail!("xrandr resize failed: {}", stderr.trim());
+    }
+
+    tracing::info!("xrandr: set framebuffer to {}x{}", width, height);
+    Ok(())
+}
+
+/// Get the first connected output name from xrandr.
+fn get_xrandr_output(display: &str) -> Option<String> {
+    let output = std::process::Command::new("xrandr")
+        .arg("--query")
+        .env("DISPLAY", display)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains(" connected") {
+            return line.split_whitespace().next().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Start the GStreamer capture/encode pipeline.
+///
+/// Returns a broadcast sender/receiver pair and a pipeline controller.
 pub fn start_pipeline(
     config: &Config,
-) -> Result<(broadcast::Receiver<EncodedFrame>, Arc<PipelineController>)> {
+) -> Result<(broadcast::Receiver<EncodedFrame>, Arc<PipelineManager>)> {
     gstreamer::init().context("Failed to init GStreamer")?;
 
     let encoder_type = detect_encoder();
+    let (frame_tx, new_controller) = start_pipeline_inner(config, encoder_type)?;
+
+    let frame_rx = frame_tx.subscribe();
+    let (watch_tx, _) = watch::channel(frame_tx);
+
+    let manager = Arc::new(PipelineManager {
+        config: Mutex::new(config.clone()),
+        encoder_type,
+        controller: Mutex::new(new_controller),
+        frame_watch_tx: watch_tx,
+    });
+
+    Ok((frame_rx, manager))
+}
+
+/// Internal: create a new pipeline, returning the broadcast sender and controller.
+fn start_pipeline_inner(
+    config: &Config,
+    encoder_type: EncoderType,
+) -> Result<(broadcast::Sender<EncodedFrame>, Arc<PipelineController>)> {
     let pipeline_str = build_pipeline_string(config, encoder_type);
 
     tracing::info!("Starting GStreamer pipeline: {}", pipeline_str);
@@ -99,7 +345,8 @@ pub fn start_pipeline(
         .by_name("encoder")
         .context("No element named 'encoder' in pipeline")?;
 
-    let (tx, rx) = broadcast::channel::<EncodedFrame>(120);
+    let (tx, _rx) = broadcast::channel::<EncodedFrame>(120);
+    let tx_for_sink = tx.clone();
 
     appsink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
@@ -123,7 +370,7 @@ pub fn start_pipeline(
                 };
 
                 // If no receivers, frames are dropped (that's fine)
-                let _ = tx.send(frame);
+                let _ = tx_for_sink.send(frame);
 
                 Ok(gstreamer::FlowSuccess::Ok)
             })
@@ -141,7 +388,7 @@ pub fn start_pipeline(
         running: AtomicBool::new(true),
     });
 
-    Ok((rx, controller))
+    Ok((tx, controller))
 }
 
 pub(crate) fn build_pipeline_string(config: &Config, encoder_type: EncoderType) -> String {

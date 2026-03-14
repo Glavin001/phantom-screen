@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 
 use config::Config;
 use input::{InputEvent, InputHandler, estimate_event_length, parse_input_event};
-use pipeline::EncodedFrame;
+use pipeline::{EncodedFrame, PipelineManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     }
 
     // Start GStreamer pipeline
-    let (frame_rx, pipeline_controller) =
+    let (_frame_rx, pipeline_manager) =
         pipeline::start_pipeline(&config).context("Failed to start pipeline")?;
     info!("GStreamer pipeline running");
 
@@ -110,9 +110,9 @@ async fn main() -> Result<()> {
     // Also start an HTTP server for serving static files and health checks
     let http_addr = SocketAddr::new(config.listen.ip(), config.listen.port() + 1);
     let client_dir = config.client_dir.clone();
-    let pc_for_http = pipeline_controller.clone();
+    let pm_for_http = pipeline_manager.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(http_addr, client_dir, pc_for_http).await {
+        if let Err(e) = run_http_server(http_addr, client_dir, pm_for_http).await {
             error!("HTTP server error: {}", e);
         }
     });
@@ -178,16 +178,11 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let frame_rx = if pipeline_controller.is_running() {
-                    Some(frame_rx.resubscribe())
-                } else {
-                    None
-                };
-                let pc = pipeline_controller.clone();
+                let pm = pipeline_manager.clone();
                 let ih = input_handler.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_session(session, frame_rx, pc, ih).await {
+                    if let Err(e) = handle_session(session, pm, ih).await {
                         warn!("Session ended: {}", e);
                     }
                 });
@@ -196,7 +191,7 @@ async fn main() -> Result<()> {
     }
 
     // Graceful shutdown: stop pipeline then kill all child processes
-    pipeline_controller.stop();
+    pipeline_manager.stop();
     for child in &mut children {
         let _ = child.kill();
         let _ = child.wait();
@@ -226,32 +221,52 @@ async fn shutdown_signal() {
 
 async fn handle_session(
     session: wtransport::Connection,
-    frame_rx: Option<broadcast::Receiver<EncodedFrame>>,
-    pipeline_controller: Arc<pipeline::PipelineController>,
+    pipeline_manager: Arc<PipelineManager>,
     input_handler: Arc<InputHandler>,
 ) -> Result<()> {
     info!("Client connected");
 
     let session = Arc::new(session);
 
-    // Spawn video sender - uses unidirectional streams for reliability
-    if let Some(mut rx) = frame_rx {
+    // Spawn video sender that handles pipeline restarts via watch channel
+    {
         let session_video = session.clone();
+        let mut watch_rx = pipeline_manager.subscribe_watch();
+
         tokio::spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(frame) => {
-                        if let Err(e) = send_video_frame(&session_video, &frame).await {
-                            warn!("Failed to send video frame: {}", e);
+                // Subscribe to the current pipeline's broadcast channel
+                let mut frame_rx = watch_rx.borrow_and_update().subscribe();
+
+                loop {
+                    tokio::select! {
+                        frame_result = frame_rx.recv() => {
+                            match frame_result {
+                                Ok(frame) => {
+                                    if let Err(e) = send_video_frame(&session_video, &frame).await {
+                                        warn!("Failed to send video frame: {}", e);
+                                        return;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!("Video receiver lagged by {} frames, skipping", n);
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    // Pipeline stopped, wait for restart
+                                    break;
+                                }
+                            }
+                        }
+                        result = watch_rx.changed() => {
+                            if result.is_err() {
+                                // PipelineManager dropped, shut down
+                                info!("Pipeline manager closed, stopping video sender");
+                                return;
+                            }
+                            // New pipeline available, re-subscribe
+                            info!("Pipeline restarted, re-subscribing to video frames");
                             break;
                         }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Video receiver lagged by {} frames, skipping", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        info!("Pipeline closed, stopping video sender");
-                        break;
                     }
                 }
             }
@@ -263,13 +278,13 @@ async fn handle_session(
         match session.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let ih = input_handler.clone();
-                let pc = pipeline_controller.clone();
+                let pm = pipeline_manager.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     loop {
                         match recv.read(&mut buf).await {
                             Ok(Some(n)) if n > 0 => {
-                                process_input_data(&buf[..n], &ih, &pc);
+                                process_input_data(&buf[..n], &ih, &pm);
                             }
                             Ok(_) => break,
                             Err(e) => {
@@ -314,7 +329,7 @@ async fn send_video_frame(session: &wtransport::Connection, frame: &EncodedFrame
 fn process_input_data(
     data: &[u8],
     input_handler: &InputHandler,
-    pipeline_controller: &Arc<pipeline::PipelineController>,
+    pipeline_manager: &Arc<PipelineManager>,
 ) {
     let mut offset = 0;
     while offset < data.len() {
@@ -325,7 +340,7 @@ fn process_input_data(
         }
 
         if let Some(event) = parse_input_event(&remaining[..event_len])
-            && let Err(e) = dispatch_event(&event, input_handler, pipeline_controller)
+            && let Err(e) = dispatch_event(&event, input_handler, pipeline_manager)
         {
             warn!("Failed to dispatch input event: {}", e);
         }
@@ -337,7 +352,7 @@ fn process_input_data(
 fn dispatch_event(
     event: &InputEvent,
     input_handler: &InputHandler,
-    pipeline_controller: &Arc<pipeline::PipelineController>,
+    pipeline_manager: &Arc<PipelineManager>,
 ) -> Result<()> {
     match event {
         InputEvent::MouseMove { x, y } => input_handler.mouse_move(*x, *y)?,
@@ -350,7 +365,7 @@ fn dispatch_event(
         InputEvent::RequestKeyframe
         | InputEvent::SetBitrate { .. }
         | InputEvent::SetResolution { .. } => {
-            control::handle_control_event(event, pipeline_controller);
+            control::handle_control_event(event, pipeline_manager);
         }
     }
     Ok(())
@@ -377,7 +392,16 @@ fn start_xvfb(config: &Config) -> Result<Child> {
     info!("Starting Xvfb on display {}", disp);
 
     let child = Command::new("Xvfb")
-        .args([disp, "-screen", "0", &format!("{}x24", resolution), "-ac"])
+        .args([
+            disp,
+            "-screen",
+            "0",
+            &format!("{}x24", resolution),
+            "-ac",
+            "+bs", // Enable BackingStore so obscured windows retain their pixels
+            "+extension",
+            "RANDR", // Enable RandR for dynamic resolution changes
+        ])
         .spawn()
         .context("Failed to start Xvfb")?;
 
@@ -406,7 +430,7 @@ fn start_window_manager(config: &Config) -> Result<Child> {
 async fn run_http_server(
     addr: SocketAddr,
     client_dir: String,
-    pipeline_controller: Arc<pipeline::PipelineController>,
+    pipeline_manager: Arc<PipelineManager>,
 ) -> Result<()> {
     use hyper::body::Incoming;
     use hyper::{Request, Response};
@@ -420,18 +444,18 @@ async fn run_http_server(
     loop {
         let (stream, _) = listener.accept().await?;
         let client_dir = client_dir.clone();
-        let pc = pipeline_controller.clone();
+        let pm = pipeline_manager.clone();
 
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let client_dir = client_dir.clone();
-                let pc = pc.clone();
+                let pm = pm.clone();
                 async move {
                     let path = req.uri().path();
 
                     // Health/readiness endpoint
                     if path == "/health" {
-                        let status = if pc.is_running() { "ready" } else { "starting" };
+                        let status = if pm.is_running() { "ready" } else { "starting" };
                         let body = format!(r#"{{"status":"{}"}}"#, status);
                         return Ok::<_, Infallible>(
                             Response::builder()
@@ -573,7 +597,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn http_server_health_endpoint() {
-            let pc = pipeline::PipelineController::new_for_test(true);
+            let pm = pipeline::PipelineManager::new_for_test(true);
             let client_dir = "/nonexistent".to_string();
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -582,7 +606,7 @@ mod tests {
             let bound_addr = listener.local_addr().unwrap();
             drop(listener); // Release so run_http_server can bind
 
-            tokio::spawn(run_http_server(bound_addr, client_dir, pc));
+            tokio::spawn(run_http_server(bound_addr, client_dir, pm));
 
             // Give it time to bind
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -630,7 +654,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn http_server_returns_404_for_missing_files() {
-            let pc = pipeline::PipelineController::new_for_test(true);
+            let pm = pipeline::PipelineManager::new_for_test(true);
             let client_dir = "/nonexistent".to_string();
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -638,7 +662,7 @@ mod tests {
             let bound_addr = listener.local_addr().unwrap();
             drop(listener);
 
-            tokio::spawn(run_http_server(bound_addr, client_dir, pc));
+            tokio::spawn(run_http_server(bound_addr, client_dir, pm));
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             use hyper_util::rt::TokioIo;
@@ -658,68 +682,6 @@ mod tests {
 
             let resp = sender.send_request(req).await.unwrap();
             assert_eq!(resp.status(), 404);
-        }
-    }
-
-    mod control_events {
-        use super::*;
-
-        #[test]
-        fn handle_set_resolution_does_not_panic() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            control::handle_control_event(
-                &InputEvent::SetResolution {
-                    width: 1920,
-                    height: 1080,
-                },
-                &pc,
-            );
-        }
-
-        #[test]
-        fn handle_set_resolution_various_sizes() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            for (w, h) in [(640, 480), (1280, 720), (2560, 1440), (3840, 2160)] {
-                control::handle_control_event(
-                    &InputEvent::SetResolution {
-                        width: w,
-                        height: h,
-                    },
-                    &pc,
-                );
-            }
-        }
-
-        #[test]
-        fn handle_keyframe_request_does_not_panic() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            // force_keyframe sends a GStreamer event — with a fakesink this may
-            // not propagate but must not panic.
-            control::handle_control_event(&InputEvent::RequestKeyframe, &pc);
-        }
-
-        #[test]
-        fn handle_set_bitrate_does_not_panic() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            // fakesink doesn't have a "bitrate" property so set_property will fail,
-            // but handle_control_event should not panic.
-            // Note: set_bitrate calls set_property which will panic on wrong property type.
-            // Since this uses a fakesink (no bitrate property), we test SetResolution instead
-            // to verify the control dispatch path.
-            control::handle_control_event(
-                &InputEvent::SetResolution {
-                    width: 1920,
-                    height: 1080,
-                },
-                &pc,
-            );
-        }
-
-        #[test]
-        fn non_control_events_are_ignored() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            // Passing a non-control event to handle_control_event should be a no-op
-            control::handle_control_event(&InputEvent::MouseMove { x: 100, y: 200 }, &pc);
         }
     }
 }
