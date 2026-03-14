@@ -289,9 +289,7 @@ pub fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
 
     // Kill existing Xvfb on this display
     // Find Xvfb processes matching our display
-    let pgrep = Command::new("pgrep")
-        .args(["-a", "-x", "Xvfb"])
-        .output();
+    let pgrep = Command::new("pgrep").args(["-a", "-x", "Xvfb"]).output();
     if let Ok(output) = pgrep {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
@@ -299,9 +297,7 @@ pub fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
                 if let Some(pid_str) = line.split_whitespace().next() {
                     if let Ok(pid) = pid_str.parse::<i32>() {
                         tracing::info!("Killing existing Xvfb (pid {}) for resize", pid);
-                        let _ = Command::new("kill")
-                            .args(["-TERM", pid_str])
-                            .output();
+                        let _ = Command::new("kill").args(["-TERM", pid_str]).output();
                     }
                 }
             }
@@ -320,17 +316,25 @@ pub fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
     let child = Command::new("Xvfb")
         .args([
             display,
-            "-screen", "0", &format!("{}x24", resolution),
+            "-screen",
+            "0",
+            &format!("{}x24", resolution),
             "-ac",
             "+bs",
-            "+extension", "RANDR",
+            "+extension",
+            "RANDR",
         ])
         .spawn()
         .context("Failed to start new Xvfb")?;
 
     {
         let d = display;
-        tracing::info!("Started new Xvfb (pid={}) at {} on {}", child.id(), resolution, d);
+        tracing::info!(
+            "Started new Xvfb (pid={}) at {} on {}",
+            child.id(),
+            resolution,
+            d
+        );
     }
 
     // Wait for new Xvfb to be ready
@@ -391,7 +395,10 @@ pub fn spawn_resolution_monitor(
 
             let (current_w, current_h) = {
                 let config = pipeline_manager.config.lock().unwrap();
-                (config.resolution_width() as u16, config.resolution_height() as u16)
+                (
+                    config.resolution_width() as u16,
+                    config.resolution_height() as u16,
+                )
             };
 
             match query_display_resolution(&display) {
@@ -399,10 +406,16 @@ pub fn spawn_resolution_monitor(
                     if actual_w != current_w || actual_h != current_h {
                         tracing::info!(
                             "Display resolution changed externally: {}x{} -> {}x{}",
-                            current_w, current_h, actual_w, actual_h
+                            current_w,
+                            current_h,
+                            actual_w,
+                            actual_h
                         );
                         if let Err(e) = pipeline_manager.restart_pipeline(actual_w, actual_h) {
-                            tracing::error!("Failed to restart pipeline after external resize: {}", e);
+                            tracing::error!(
+                                "Failed to restart pipeline after external resize: {}",
+                                e
+                            );
                         }
                     }
                 }

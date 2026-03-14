@@ -71,11 +71,7 @@ async fn main() -> Result<()> {
     // Monitor the X display for external resolution changes (e.g. xrandr, apps)
     let pm_for_monitor = pipeline_manager.clone();
     let display_for_monitor = config.display.clone();
-    pipeline::spawn_resolution_monitor(
-        pm_for_monitor,
-        display_for_monitor,
-        Duration::from_secs(2),
-    );
+    pipeline::spawn_resolution_monitor(pm_for_monitor, display_for_monitor, Duration::from_secs(2));
 
     // Create input handler
     let input_handler =
