@@ -14,13 +14,12 @@ pub fn handle_control_event(event: &InputEvent, controller: &Arc<PipelineControl
         }
         InputEvent::SetResolution { width, height } => {
             tracing::info!("Resolution change requested: {}x{}", width, height);
-            // Resolution changes require pipeline restart - log for now
-            // Full implementation would stop pipeline, reconfigure Xvfb, restart
             tracing::warn!(
-                "Dynamic resolution change not yet implemented (requested {}x{})",
+                "Dynamic resolution change not yet implemented (requested {}x{}); ignoring request",
                 width,
                 height
             );
+            tracing::info!("Stream continues at current resolution; no pipeline change");
         }
         _ => {}
     }

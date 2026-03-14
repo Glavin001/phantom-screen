@@ -29,6 +29,50 @@ See `README.md` for full details. Quick reference:
 
 The server auto-starts Xvfb (`:99`), openbox window manager, and the GStreamer pipeline. It generates self-signed TLS certs if `--cert`/`--key` are not provided.
 
+### Local CI
+
+Run all GitHub Actions CI checks locally with:
+
+```bash
+./tests/local-ci.sh
+```
+
+Filter by component:
+
+| Flag | What it runs |
+|------|-------------|
+| `--rust-only` | `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test --verbose` |
+| `--client-only` | `npm run typecheck`, `npm test`, `npm run build`, `npm pack:tarball`, client-package-smoke.sh |
+| `--docker-only` | `docker build -t phantom-screen -f server/Dockerfile .` |
+| `--e2e-only` | `tests/e2e.sh` (builds Docker image, starts container, runs integration tests) |
+
+Rust and client checks run natively. Docker build and E2E tests require Docker.
+
+### System dependencies for native builds
+
+The Rust server needs these apt packages at compile time:
+
+```bash
+sudo apt-get install -y pkg-config libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev libx11-dev libxcb1-dev libxcb-xtest0-dev
+```
+
+### Docker setup
+
+Start the Docker daemon if it isn't running:
+
+```bash
+sudo dockerd &>/tmp/dockerd.log &
+```
+
+**Proxy environments**: Docker builds run `apt-get` inside Debian containers which may fail behind corporate proxies. The `tests/docker-proxy-helper.sh` helper handles this automatically — it patches Dockerfiles on-the-fly to use HTTPS apt sources, inject proxy CA certs, and set `NODE_EXTRA_CA_CERTS`/`CARGO_HTTP_CAINFO`. Both `local-ci.sh` and `e2e.sh` source this helper. If Docker DNS doesn't work, configure the daemon:
+
+```bash
+echo '{"dns": ["8.8.8.8", "8.8.4.4"]}' | sudo tee /etc/docker/daemon.json
+```
+
+If the proxy blocks plain HTTP to Debian repos (returns 500), the helper switches to HTTPS with `Acquire::https::Verify-Peer "false"` for apt and installs proxy CA certs from `/usr/local/share/ca-certificates/` for cargo/npm.
+
 ### Non-obvious caveats
 
 - **Rust edition 2024**: The server requires Rust >= 1.85. The pre-installed Rust in the VM may be older; run `rustup update stable` if `cargo build` fails with edition errors.

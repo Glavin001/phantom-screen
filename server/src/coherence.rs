@@ -1,0 +1,311 @@
+//! Coherence Mode session orchestration.
+//!
+//! Ties together the window monitor, per-window pipeline manager, and
+//! WebTransport session to deliver per-window video streams and window events.
+
+use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{Mutex, broadcast};
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+
+use crate::pipeline::EncodedFrame;
+use crate::window_monitor::{TrackedWindows, WindowEvent, WindowManager};
+use crate::window_pipeline::WindowPipelineManager;
+
+/// Shared state for coherence mode, shared across all sessions.
+pub struct CoherenceState {
+    pub window_events: broadcast::Sender<WindowEvent>,
+    pub tracked_windows: TrackedWindows,
+    pub pipeline_manager: Arc<Mutex<WindowPipelineManager>>,
+    pub window_manager: Arc<WindowManager>,
+}
+
+impl CoherenceState {
+    /// Get the current window list as a snapshot event.
+    pub fn current_snapshot(&self) -> WindowEvent {
+        let windows = self
+            .tracked_windows
+            .lock()
+            .map(|tracked| tracked.values().cloned().collect())
+            .unwrap_or_default();
+        WindowEvent::Snapshot(windows)
+    }
+}
+
+/// Per-session coherence handler.
+pub struct CoherenceSession {
+    window_event_rx: broadcast::Receiver<WindowEvent>,
+    pipeline_manager: Arc<Mutex<WindowPipelineManager>>,
+    window_manager: Arc<WindowManager>,
+    subscriptions: HashMap<u32, JoinHandle<()>>,
+}
+
+impl CoherenceSession {
+    pub fn new(state: &CoherenceState) -> Self {
+        Self {
+            window_event_rx: state.window_events.subscribe(),
+            pipeline_manager: state.pipeline_manager.clone(),
+            window_manager: state.window_manager.clone(),
+            subscriptions: HashMap::new(),
+        }
+    }
+
+    /// Subscribe to a window's video stream.
+    /// Returns a receiver for that window's encoded frames.
+    pub async fn subscribe_window(
+        &mut self,
+        window_id: u32,
+    ) -> Result<broadcast::Receiver<EncodedFrame>> {
+        let mut mgr = self.pipeline_manager.lock().await;
+        let rx = mgr.start_window(window_id)?;
+        info!("Session subscribed to window {}", window_id);
+        Ok(rx)
+    }
+
+    /// Unsubscribe from a window's video stream.
+    pub async fn unsubscribe_window(&mut self, window_id: u32) {
+        if let Some(handle) = self.subscriptions.remove(&window_id) {
+            info!("Window {} unsubscribe: ABORTING sender task", window_id);
+            handle.abort();
+        } else {
+            warn!(
+                "Window {} unsubscribe: NO sender task found in subscriptions!",
+                window_id
+            );
+        }
+        info!("Session unsubscribed from window {}", window_id);
+    }
+
+    /// Track a frame sender task for a window.
+    pub fn track_sender(&mut self, window_id: u32, handle: JoinHandle<()>) {
+        if let Some(old) = self.subscriptions.insert(window_id, handle) {
+            info!(
+                "Window {} track_sender: ABORTING old sender task",
+                window_id
+            );
+            old.abort();
+        } else {
+            info!(
+                "Window {} track_sender: no previous sender (first subscribe)",
+                window_id
+            );
+        }
+    }
+
+    /// Resize a remote X11 window.
+    pub fn resize_window(&self, window_id: u32, width: u16, height: u16) -> Result<()> {
+        self.window_manager.resize(window_id, width, height)
+    }
+
+    /// Focus/raise a remote X11 window.
+    pub fn focus_window(&self, window_id: u32) -> Result<()> {
+        self.window_manager.raise(window_id)
+    }
+
+    /// Close a remote X11 window.
+    pub fn close_window(&self, window_id: u32) -> Result<()> {
+        self.window_manager.close(window_id)
+    }
+
+    /// Get the next window event from the monitor.
+    pub async fn next_window_event(&mut self) -> Option<WindowEvent> {
+        match self.window_event_rx.recv().await {
+            Ok(event) => Some(event),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("Window event receiver lagged by {} events", n);
+                // Try again
+                self.window_event_rx.recv().await.ok()
+            }
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+
+    /// Clean up all subscriptions.
+    pub fn cleanup(&mut self) {
+        for (_, handle) in self.subscriptions.drain() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for CoherenceSession {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Serialize a WindowEvent for sending to the client over the coherence event stream.
+///
+/// Format: [0x40][subtype][...payload]
+pub fn serialize_window_event(event: &WindowEvent) -> Vec<u8> {
+    match event {
+        WindowEvent::Snapshot(windows) => {
+            let mut buf = vec![0x40, 0x01];
+            buf.extend_from_slice(&(windows.len() as u16).to_be_bytes());
+            for w in windows {
+                buf.extend(w.serialize());
+            }
+            buf
+        }
+        WindowEvent::Added(info) => {
+            let mut buf = vec![0x40, 0x02];
+            buf.extend(info.serialize());
+            buf
+        }
+        WindowEvent::Removed { window_id } => {
+            let mut buf = vec![0x40, 0x03];
+            buf.extend_from_slice(&window_id.to_be_bytes());
+            buf
+        }
+        WindowEvent::Resized {
+            window_id,
+            width,
+            height,
+        } => {
+            let mut buf = vec![0x40, 0x04];
+            buf.extend_from_slice(&window_id.to_be_bytes());
+            // x and y are not changed in resize events, use 0
+            buf.extend_from_slice(&0i16.to_be_bytes());
+            buf.extend_from_slice(&0i16.to_be_bytes());
+            buf.extend_from_slice(&width.to_be_bytes());
+            buf.extend_from_slice(&height.to_be_bytes());
+            buf
+        }
+        WindowEvent::Moved { window_id, x, y } => {
+            let mut buf = vec![0x40, 0x04];
+            buf.extend_from_slice(&window_id.to_be_bytes());
+            buf.extend_from_slice(&x.to_be_bytes());
+            buf.extend_from_slice(&y.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+            buf
+        }
+        WindowEvent::TitleChanged { window_id, title } => {
+            let title_bytes = title.as_bytes();
+            let mut buf = vec![0x40, 0x05];
+            buf.extend_from_slice(&window_id.to_be_bytes());
+            buf.extend_from_slice(&(title_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(title_bytes);
+            buf
+        }
+        WindowEvent::VisibilityChanged { window_id, visible } => {
+            let mut buf = vec![0x40, 0x06];
+            buf.extend_from_slice(&window_id.to_be_bytes());
+            buf.push(if *visible { 1 } else { 0 });
+            buf
+        }
+    }
+}
+
+/// Send an encoded video frame tagged with a window ID over a WebTransport unidirectional stream.
+///
+/// Extended frame format:
+/// [flags: u8] [window_id: u32 BE] [pts: u64 BE] [length: u32 BE] [H.264 data...]
+///   flags: bit 0 = keyframe, bit 1 = window frame (always set here)
+pub async fn send_window_video_frame(
+    session: &wtransport::Connection,
+    window_id: u32,
+    frame: &EncodedFrame,
+) -> Result<()> {
+    let mut stream = session.open_uni().await?.await?;
+
+    let flags: u8 = (if frame.is_keyframe { 0x01 } else { 0x00 }) | 0x02; // bit 1 = window frame
+    let mut header = [0u8; 17];
+    header[0] = flags;
+    header[1..5].copy_from_slice(&window_id.to_be_bytes());
+    header[5..13].copy_from_slice(&frame.pts.to_be_bytes());
+    header[13..17].copy_from_slice(&(frame.data.len() as u32).to_be_bytes());
+
+    stream.write_all(&header).await?;
+    stream.write_all(&frame.data).await?;
+    stream.finish().await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::window_monitor::WindowInfo;
+
+    #[test]
+    fn serialize_snapshot_event() {
+        let event = WindowEvent::Snapshot(vec![WindowInfo {
+            window_id: 1,
+            title: "Test".into(),
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+            visible: true,
+            app_class: "test".into(),
+        }]);
+
+        let data = serialize_window_event(&event);
+        assert_eq!(data[0], 0x40);
+        assert_eq!(data[1], 0x01);
+        let count = u16::from_be_bytes([data[2], data[3]]);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn serialize_added_event() {
+        let event = WindowEvent::Added(WindowInfo {
+            window_id: 42,
+            title: "Firefox".into(),
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 768,
+            visible: true,
+            app_class: "Navigator".into(),
+        });
+
+        let data = serialize_window_event(&event);
+        assert_eq!(data[0], 0x40);
+        assert_eq!(data[1], 0x02);
+        let wid = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+        assert_eq!(wid, 42);
+    }
+
+    #[test]
+    fn serialize_removed_event() {
+        let event = WindowEvent::Removed { window_id: 99 };
+        let data = serialize_window_event(&event);
+        assert_eq!(data[0], 0x40);
+        assert_eq!(data[1], 0x03);
+        let wid = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+        assert_eq!(wid, 99);
+        assert_eq!(data.len(), 6);
+    }
+
+    #[test]
+    fn serialize_title_changed_event() {
+        let event = WindowEvent::TitleChanged {
+            window_id: 5,
+            title: "New Title".into(),
+        };
+        let data = serialize_window_event(&event);
+        assert_eq!(data[0], 0x40);
+        assert_eq!(data[1], 0x05);
+        let wid = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+        assert_eq!(wid, 5);
+        let title_len = u16::from_be_bytes([data[6], data[7]]) as usize;
+        let title = std::str::from_utf8(&data[8..8 + title_len]).unwrap();
+        assert_eq!(title, "New Title");
+    }
+
+    #[test]
+    fn serialize_visibility_changed_event() {
+        let event = WindowEvent::VisibilityChanged {
+            window_id: 7,
+            visible: false,
+        };
+        let data = serialize_window_event(&event);
+        assert_eq!(data[0], 0x40);
+        assert_eq!(data[1], 0x06);
+        assert_eq!(data[6], 0); // not visible
+    }
+}

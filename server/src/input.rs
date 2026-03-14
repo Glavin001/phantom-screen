@@ -102,7 +102,7 @@ impl InputHandler {
             .get(code)
             .copied()
             .or_else(|| dom_code_to_keycode_fallback(code))
-            .context(format!("Unknown key code: {}", code))?;
+            .context(format!("Unknown key code: {code}"))?;
 
         let event_type = if pressed { 2 } else { 3 }; // KeyPress / KeyRelease
         let root = self.root_window();
@@ -185,6 +185,7 @@ pub fn parse_input_event(data: &[u8]) -> Option<InputEvent> {
             Some(InputEvent::Clipboard { text })
         }
         0x30 if data.len() >= 2 => parse_control_event(data),
+        0x40 if data.len() >= 2 => parse_coherence_event(data),
         _ => None,
     }
 }
@@ -208,16 +209,100 @@ fn parse_control_event(data: &[u8]) -> Option<InputEvent> {
     }
 }
 
+fn parse_coherence_event(data: &[u8]) -> Option<InputEvent> {
+    match data[1] {
+        0x01 => Some(InputEvent::EnableCoherence),
+        0x02 => Some(InputEvent::DisableCoherence),
+        0x03 if data.len() >= 6 => {
+            let wid = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+            Some(InputEvent::SubscribeWindow { window_id: wid })
+        }
+        0x04 if data.len() >= 6 => {
+            let wid = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+            Some(InputEvent::UnsubscribeWindow { window_id: wid })
+        }
+        0x05 if data.len() >= 10 => {
+            let wid = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+            let w = u16::from_be_bytes([data[6], data[7]]);
+            let h = u16::from_be_bytes([data[8], data[9]]);
+            Some(InputEvent::ResizeWindow {
+                window_id: wid,
+                width: w,
+                height: h,
+            })
+        }
+        0x06 if data.len() >= 6 => {
+            let wid = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+            Some(InputEvent::FocusWindow { window_id: wid })
+        }
+        0x07 if data.len() >= 6 => {
+            let wid = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+            Some(InputEvent::CloseWindow { window_id: wid })
+        }
+        0x08 if data.len() >= 4 => {
+            let cmd_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+            if data.len() < 4 + cmd_len {
+                return None;
+            }
+            let command = std::str::from_utf8(&data[4..4 + cmd_len]).ok()?.to_string();
+            Some(InputEvent::LaunchApp { command })
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub enum InputEvent {
-    MouseMove { x: u16, y: u16 },
-    MouseButton { button: u8, pressed: bool },
-    MouseScroll { dx: i16, dy: i16 },
-    KeyEvent { code: String, pressed: bool },
-    Clipboard { text: String },
+    MouseMove {
+        x: u16,
+        y: u16,
+    },
+    MouseButton {
+        button: u8,
+        pressed: bool,
+    },
+    MouseScroll {
+        dx: i16,
+        dy: i16,
+    },
+    KeyEvent {
+        code: String,
+        pressed: bool,
+    },
+    Clipboard {
+        text: String,
+    },
     RequestKeyframe,
-    SetBitrate { kbps: u32 },
-    SetResolution { width: u16, height: u16 },
+    SetBitrate {
+        kbps: u32,
+    },
+    SetResolution {
+        width: u16,
+        height: u16,
+    },
+    // Coherence mode events (0x40 prefix)
+    EnableCoherence,
+    DisableCoherence,
+    SubscribeWindow {
+        window_id: u32,
+    },
+    UnsubscribeWindow {
+        window_id: u32,
+    },
+    ResizeWindow {
+        window_id: u32,
+        width: u16,
+        height: u16,
+    },
+    FocusWindow {
+        window_id: u32,
+    },
+    CloseWindow {
+        window_id: u32,
+    },
+    LaunchApp {
+        command: String,
+    },
 }
 
 /// Build a mapping from DOM KeyboardEvent.code to X11 keycode.
@@ -275,12 +360,12 @@ fn build_dom_to_x11_keycode_map() -> HashMap<String, u8> {
 
     // Digits
     for i in 0..=9u8 {
-        map.insert(format!("Digit{}", i), if i == 0 { 19 } else { 10 + i - 1 });
+        map.insert(format!("Digit{i}"), if i == 0 { 19 } else { 10 + i - 1 });
     }
 
     // Function keys (F1–F10 are 67–76, F11=95, F12=96 on standard X11)
     for i in 1..=10u8 {
-        map.insert(format!("F{}", i), 66 + i);
+        map.insert(format!("F{i}"), 66 + i);
     }
     map.insert("F11".into(), 95);
     map.insert("F12".into(), 96);
@@ -387,6 +472,25 @@ pub fn estimate_event_length(data: &[u8]) -> usize {
                 0x01 => 2,
                 0x02 => 6,
                 0x03 => 6,
+                _ => 0,
+            }
+        }
+        0x40 => {
+            if data.len() < 2 {
+                return 0;
+            }
+            match data[1] {
+                0x01 | 0x02 => 2,               // Enable/Disable coherence
+                0x03 | 0x04 | 0x06 | 0x07 => 6, // Subscribe/Unsubscribe/Focus/Close (wid)
+                0x05 => 10,                     // Resize (wid + w + h)
+                0x08 => {
+                    // LaunchApp: [0x40][0x08][cmd_len:u16][cmd:utf8]
+                    if data.len() < 4 {
+                        return 0;
+                    }
+                    let cmd_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+                    4 + cmd_len
+                }
                 _ => 0,
             }
         }
@@ -774,5 +878,148 @@ mod tests {
             map["Numpad0"] + 1,
             "Numpad1 must not be Numpad0+1 (numpad layout is not sequential)"
         );
+    }
+
+    // ── Coherence mode protocol tests ─────────────────────────────────
+
+    #[test]
+    fn test_parse_enable_coherence() {
+        let data = [0x40, 0x01];
+        let event = parse_input_event(&data).unwrap();
+        assert!(matches!(event, InputEvent::EnableCoherence));
+        assert_eq!(estimate_event_length(&data), 2);
+    }
+
+    #[test]
+    fn test_parse_disable_coherence() {
+        let data = [0x40, 0x02];
+        let event = parse_input_event(&data).unwrap();
+        assert!(matches!(event, InputEvent::DisableCoherence));
+        assert_eq!(estimate_event_length(&data), 2);
+    }
+
+    #[test]
+    fn test_parse_subscribe_window() {
+        let data = [0x40, 0x03, 0x00, 0x01, 0x00, 0x42]; // window_id = 0x00010042
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::SubscribeWindow { window_id } => assert_eq!(window_id, 0x00010042),
+            _ => panic!("Expected SubscribeWindow"),
+        }
+        assert_eq!(estimate_event_length(&data), 6);
+    }
+
+    #[test]
+    fn test_parse_unsubscribe_window() {
+        let data = [0x40, 0x04, 0x00, 0x00, 0x00, 0x01];
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::UnsubscribeWindow { window_id } => assert_eq!(window_id, 1),
+            _ => panic!("Expected UnsubscribeWindow"),
+        }
+        assert_eq!(estimate_event_length(&data), 6);
+    }
+
+    #[test]
+    fn test_parse_resize_window() {
+        // [0x40][0x05][wid:u32][w:u16][h:u16]
+        let data = [0x40, 0x05, 0x00, 0x00, 0x00, 0x0A, 0x03, 0x20, 0x02, 0x58]; // wid=10, 800x600
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::ResizeWindow {
+                window_id,
+                width,
+                height,
+            } => {
+                assert_eq!(window_id, 10);
+                assert_eq!(width, 800);
+                assert_eq!(height, 600);
+            }
+            _ => panic!("Expected ResizeWindow"),
+        }
+        assert_eq!(estimate_event_length(&data), 10);
+    }
+
+    #[test]
+    fn test_parse_focus_window() {
+        let data = [0x40, 0x06, 0x00, 0x00, 0x00, 0xFF];
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::FocusWindow { window_id } => assert_eq!(window_id, 255),
+            _ => panic!("Expected FocusWindow"),
+        }
+        assert_eq!(estimate_event_length(&data), 6);
+    }
+
+    #[test]
+    fn test_parse_close_window() {
+        let data = [0x40, 0x07, 0x00, 0x00, 0x01, 0x00];
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::CloseWindow { window_id } => assert_eq!(window_id, 256),
+            _ => panic!("Expected CloseWindow"),
+        }
+        assert_eq!(estimate_event_length(&data), 6);
+    }
+
+    #[test]
+    fn test_parse_launch_app() {
+        let cmd = b"xterm";
+        let mut data = vec![0x40, 0x08];
+        data.extend_from_slice(&(cmd.len() as u16).to_be_bytes());
+        data.extend_from_slice(cmd);
+
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::LaunchApp { command } => assert_eq!(command, "xterm"),
+            _ => panic!("Expected LaunchApp"),
+        }
+        assert_eq!(estimate_event_length(&data), 4 + cmd.len());
+    }
+
+    #[test]
+    fn test_parse_launch_app_with_args() {
+        let cmd = b"firefox --private-window";
+        let mut data = vec![0x40, 0x08];
+        data.extend_from_slice(&(cmd.len() as u16).to_be_bytes());
+        data.extend_from_slice(cmd);
+
+        let event = parse_input_event(&data).unwrap();
+        match event {
+            InputEvent::LaunchApp { command } => assert_eq!(command, "firefox --private-window"),
+            _ => panic!("Expected LaunchApp"),
+        }
+    }
+
+    #[test]
+    fn test_parse_coherence_truncated() {
+        // Only type byte, no subtype
+        assert!(parse_input_event(&[0x40]).is_none());
+        // Subscribe needs 6 bytes, only has 4
+        assert!(parse_input_event(&[0x40, 0x03, 0x00, 0x01]).is_none());
+        // Resize needs 10 bytes, only has 8
+        assert!(parse_input_event(&[0x40, 0x05, 0x00, 0x00, 0x00, 0x01, 0x03, 0x20]).is_none());
+        // LaunchApp says cmd_len=10 but no data
+        assert!(parse_input_event(&[0x40, 0x08, 0x00, 0x0A]).is_none());
+    }
+
+    #[test]
+    fn test_estimate_coherence_event_lengths() {
+        assert_eq!(estimate_event_length(&[0x40, 0x01]), 2);
+        assert_eq!(estimate_event_length(&[0x40, 0x02]), 2);
+        assert_eq!(estimate_event_length(&[0x40, 0x03, 0, 0, 0, 0]), 6);
+        assert_eq!(estimate_event_length(&[0x40, 0x04, 0, 0, 0, 0]), 6);
+        assert_eq!(
+            estimate_event_length(&[0x40, 0x05, 0, 0, 0, 0, 0, 0, 0, 0]),
+            10
+        );
+        assert_eq!(estimate_event_length(&[0x40, 0x06, 0, 0, 0, 0]), 6);
+        assert_eq!(estimate_event_length(&[0x40, 0x07, 0, 0, 0, 0]), 6);
+        assert_eq!(
+            estimate_event_length(&[0x40, 0x08, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o']),
+            9
+        );
+        // Unknown subtype
+        assert_eq!(estimate_event_length(&[0x40, 0xFF]), 0);
     }
 }
