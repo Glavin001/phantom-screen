@@ -501,7 +501,10 @@ export class PhantomScreenClient {
       for (const app of apps) {
         const btn = document.createElement('button');
         btn.className = 'phantom-screen-launch-btn';
-        btn.textContent = app;
+        // Show friendly label (first word, capitalized) but send full command on click
+        const label = app.trim().split(/\s+/)[0] || app;
+        btn.textContent = label.charAt(0).toUpperCase() + label.slice(1).toLowerCase();
+        btn.title = app;
         btn.addEventListener('click', () => {
           this.launchApp(app);
         });

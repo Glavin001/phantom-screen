@@ -1,6 +1,6 @@
 FROM debian:trixie-slim AS base
 
-# Install system dependencies
+# Install system dependencies and demo apps (browsers, terminal, editor)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     openbox \
@@ -12,8 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-x \
     xdotool \
     xclip \
-    xterm \
     ca-certificates \
+    fonts-liberation \
+    xterm \
+    firefox-esr \
+    chromium \
+    l3afpad \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Build stage for server ---
