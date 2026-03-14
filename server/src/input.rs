@@ -253,23 +253,56 @@ fn parse_coherence_event(data: &[u8]) -> Option<InputEvent> {
 
 #[derive(Debug)]
 pub enum InputEvent {
-    MouseMove { x: u16, y: u16 },
-    MouseButton { button: u8, pressed: bool },
-    MouseScroll { dx: i16, dy: i16 },
-    KeyEvent { code: String, pressed: bool },
-    Clipboard { text: String },
+    MouseMove {
+        x: u16,
+        y: u16,
+    },
+    MouseButton {
+        button: u8,
+        pressed: bool,
+    },
+    MouseScroll {
+        dx: i16,
+        dy: i16,
+    },
+    KeyEvent {
+        code: String,
+        pressed: bool,
+    },
+    Clipboard {
+        text: String,
+    },
     RequestKeyframe,
-    SetBitrate { kbps: u32 },
-    SetResolution { width: u16, height: u16 },
+    SetBitrate {
+        kbps: u32,
+    },
+    SetResolution {
+        width: u16,
+        height: u16,
+    },
     // Coherence mode events (0x40 prefix)
     EnableCoherence,
     DisableCoherence,
-    SubscribeWindow { window_id: u32 },
-    UnsubscribeWindow { window_id: u32 },
-    ResizeWindow { window_id: u32, width: u16, height: u16 },
-    FocusWindow { window_id: u32 },
-    CloseWindow { window_id: u32 },
-    LaunchApp { command: String },
+    SubscribeWindow {
+        window_id: u32,
+    },
+    UnsubscribeWindow {
+        window_id: u32,
+    },
+    ResizeWindow {
+        window_id: u32,
+        width: u16,
+        height: u16,
+    },
+    FocusWindow {
+        window_id: u32,
+    },
+    CloseWindow {
+        window_id: u32,
+    },
+    LaunchApp {
+        command: String,
+    },
 }
 
 /// Build a mapping from DOM KeyboardEvent.code to X11 keycode.
@@ -447,9 +480,9 @@ pub fn estimate_event_length(data: &[u8]) -> usize {
                 return 0;
             }
             match data[1] {
-                0x01 | 0x02 => 2,                    // Enable/Disable coherence
-                0x03 | 0x04 | 0x06 | 0x07 => 6,      // Subscribe/Unsubscribe/Focus/Close (wid)
-                0x05 => 10,                            // Resize (wid + w + h)
+                0x01 | 0x02 => 2,               // Enable/Disable coherence
+                0x03 | 0x04 | 0x06 | 0x07 => 6, // Subscribe/Unsubscribe/Focus/Close (wid)
+                0x05 => 10,                     // Resize (wid + w + h)
                 0x08 => {
                     // LaunchApp: [0x40][0x08][cmd_len:u16][cmd:utf8]
                     if data.len() < 4 {

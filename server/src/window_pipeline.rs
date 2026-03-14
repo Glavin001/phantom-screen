@@ -120,14 +120,17 @@ impl WindowPipelineManager {
                         .map_err(|_| gstreamer::FlowError::Error)?;
 
                     let pts = buffer.pts().map(|p| p.nseconds()).unwrap_or(0);
-                    let is_keyframe =
-                        !buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT);
+                    let is_keyframe = !buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT);
 
                     let count = frame_counter_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if count < 3 {
                         tracing::info!(
                             "Window {} frame #{}: {} bytes, keyframe={}, pts={}",
-                            wid_for_cb, count, map.len(), is_keyframe, pts
+                            wid_for_cb,
+                            count,
+                            map.len(),
+                            is_keyframe,
+                            pts
                         );
                     }
 
@@ -221,7 +224,10 @@ fn force_keyframe(pipeline: &gstreamer::Pipeline, window_id: u32) {
         if encoder.send_event(event) {
             tracing::info!("Forced keyframe for window {} pipeline", window_id);
         } else {
-            tracing::warn!("Failed to send force-keyframe event for window {}", window_id);
+            tracing::warn!(
+                "Failed to send force-keyframe event for window {}",
+                window_id
+            );
         }
     }
 }

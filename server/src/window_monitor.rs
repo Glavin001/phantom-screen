@@ -43,21 +43,11 @@ pub enum WindowEvent {
         height: u16,
     },
     /// A window was moved.
-    Moved {
-        window_id: u32,
-        x: i16,
-        y: i16,
-    },
+    Moved { window_id: u32, x: i16, y: i16 },
     /// A window title changed.
-    TitleChanged {
-        window_id: u32,
-        title: String,
-    },
+    TitleChanged { window_id: u32, title: String },
     /// A window's visibility changed (mapped/unmapped).
-    VisibilityChanged {
-        window_id: u32,
-        visible: bool,
-    },
+    VisibilityChanged { window_id: u32, visible: bool },
 }
 
 /// Serialization format for WindowInfo on the wire.
@@ -66,8 +56,9 @@ impl WindowInfo {
     pub fn serialize(&self) -> Vec<u8> {
         let title_bytes = self.title.as_bytes();
         let class_bytes = self.app_class.as_bytes();
-        let mut buf =
-            Vec::with_capacity(4 + 2 + 2 + 2 + 2 + 1 + 2 + title_bytes.len() + 2 + class_bytes.len());
+        let mut buf = Vec::with_capacity(
+            4 + 2 + 2 + 2 + 2 + 1 + 2 + title_bytes.len() + 2 + class_bytes.len(),
+        );
 
         buf.extend_from_slice(&self.window_id.to_be_bytes());
         buf.extend_from_slice(&self.x.to_be_bytes());
@@ -148,7 +139,11 @@ pub struct WindowMonitorHandle {
 /// Returns a broadcast receiver for window events and a handle to keep the monitor alive.
 pub fn start_window_monitor(
     display: &str,
-) -> Result<(broadcast::Receiver<WindowEvent>, TrackedWindows, WindowMonitorHandle)> {
+) -> Result<(
+    broadcast::Receiver<WindowEvent>,
+    TrackedWindows,
+    WindowMonitorHandle,
+)> {
     let (tx, rx) = broadcast::channel::<WindowEvent>(256);
     let tracked_windows: TrackedWindows = Arc::new(StdMutex::new(HashMap::new()));
     let tracked_clone = tracked_windows.clone();
@@ -213,9 +208,13 @@ impl Atoms {
     }
 }
 
-fn run_monitor_loop(display: &str, tx: &broadcast::Sender<WindowEvent>, shared_tracked: &TrackedWindows) -> Result<()> {
-    let (conn, screen_num) =
-        RustConnection::connect(Some(display)).context("Failed to connect to X11 for monitoring")?;
+fn run_monitor_loop(
+    display: &str,
+    tx: &broadcast::Sender<WindowEvent>,
+    shared_tracked: &TrackedWindows,
+) -> Result<()> {
+    let (conn, screen_num) = RustConnection::connect(Some(display))
+        .context("Failed to connect to X11 for monitoring")?;
     let root = conn.setup().roots[screen_num].root;
     let atoms = Atoms::intern(&conn)?;
 
@@ -234,10 +233,7 @@ fn run_monitor_loop(display: &str, tx: &broadcast::Sender<WindowEvent>, shared_t
     enumerate_windows(&conn, root, &atoms, &mut tracked)?;
 
     let snapshot: Vec<WindowInfo> = tracked.values().cloned().collect();
-    tracing::info!(
-        "Window monitor started, found {} windows",
-        snapshot.len()
-    );
+    tracing::info!("Window monitor started, found {} windows", snapshot.len());
     // Update shared state so late subscribers can get a fresh snapshot
     if let Ok(mut shared) = shared_tracked.lock() {
         *shared = tracked.clone();
@@ -275,8 +271,10 @@ fn run_monitor_loop(display: &str, tx: &broadcast::Sender<WindowEvent>, shared_t
                         let _ = tx.send(WindowEvent::Added(info.clone()));
                         let _ = conn.change_window_attributes(
                             win,
-                            &xproto::ChangeWindowAttributesAux::new()
-                                .event_mask(xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY),
+                            &xproto::ChangeWindowAttributesAux::new().event_mask(
+                                xproto::EventMask::PROPERTY_CHANGE
+                                    | xproto::EventMask::STRUCTURE_NOTIFY,
+                            ),
                         );
                         let _ = conn.flush();
                         tracked.insert(win, info);
@@ -290,12 +288,18 @@ fn run_monitor_loop(display: &str, tx: &broadcast::Sender<WindowEvent>, shared_t
                                         continue;
                                     }
                                     if let Some(info) = query_window_info(&conn, child, &atoms) {
-                                        tracing::info!("Window added (via WM frame): {} ({})", info.title, child);
+                                        tracing::info!(
+                                            "Window added (via WM frame): {} ({})",
+                                            info.title,
+                                            child
+                                        );
                                         let _ = tx.send(WindowEvent::Added(info.clone()));
                                         let _ = conn.change_window_attributes(
                                             child,
-                                            &xproto::ChangeWindowAttributesAux::new()
-                                                .event_mask(xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY),
+                                            &xproto::ChangeWindowAttributesAux::new().event_mask(
+                                                xproto::EventMask::PROPERTY_CHANGE
+                                                    | xproto::EventMask::STRUCTURE_NOTIFY,
+                                            ),
                                         );
                                         let _ = conn.flush();
                                         tracked.insert(child, info);
@@ -381,8 +385,10 @@ fn run_monitor_loop(display: &str, tx: &broadcast::Sender<WindowEvent>, shared_t
                     if let Some(info) = query_window_info(&conn, e.window, &atoms) {
                         let _ = conn.change_window_attributes(
                             e.window,
-                            &xproto::ChangeWindowAttributesAux::new()
-                                .event_mask(xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY),
+                            &xproto::ChangeWindowAttributesAux::new().event_mask(
+                                xproto::EventMask::PROPERTY_CHANGE
+                                    | xproto::EventMask::STRUCTURE_NOTIFY,
+                            ),
                         );
                         let _ = conn.flush();
                         let _ = tx.send(WindowEvent::Added(info.clone()));
@@ -420,8 +426,9 @@ fn enumerate_windows(
             // Subscribe to property/structure changes
             let _ = conn.change_window_attributes(
                 child,
-                &xproto::ChangeWindowAttributesAux::new()
-                    .event_mask(xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY),
+                &xproto::ChangeWindowAttributesAux::new().event_mask(
+                    xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY,
+                ),
             );
             tracked.insert(child, info);
         }
@@ -436,8 +443,10 @@ fn enumerate_windows(
                     if let Some(info) = query_window_info(conn, grandchild, atoms) {
                         let _ = conn.change_window_attributes(
                             grandchild,
-                            &xproto::ChangeWindowAttributesAux::new()
-                                .event_mask(xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY),
+                            &xproto::ChangeWindowAttributesAux::new().event_mask(
+                                xproto::EventMask::PROPERTY_CHANGE
+                                    | xproto::EventMask::STRUCTURE_NOTIFY,
+                            ),
                         );
                         tracked.insert(grandchild, info);
                     }
@@ -502,13 +511,16 @@ fn query_window_info(
 }
 
 /// Check if a window's _NET_WM_WINDOW_TYPE indicates it should be tracked.
-fn is_trackable_window_type(
-    conn: &RustConnection,
-    window: xproto::Window,
-    atoms: &Atoms,
-) -> bool {
+fn is_trackable_window_type(conn: &RustConnection, window: xproto::Window, atoms: &Atoms) -> bool {
     let reply = conn
-        .get_property(false, window, atoms.net_wm_window_type, xproto::AtomEnum::ATOM, 0, 32)
+        .get_property(
+            false,
+            window,
+            atoms.net_wm_window_type,
+            xproto::AtomEnum::ATOM,
+            0,
+            32,
+        )
         .ok()
         .and_then(|cookie| cookie.reply().ok());
 
@@ -631,13 +643,9 @@ pub fn raise_window(conn: &RustConnection, window: u32) -> Result<()> {
     .check()
     .context("Failed to raise window")?;
 
-    conn.set_input_focus(
-        xproto::InputFocus::PARENT,
-        window,
-        x11rb::CURRENT_TIME,
-    )?
-    .check()
-    .context("Failed to focus window")?;
+    conn.set_input_focus(xproto::InputFocus::PARENT, window, x11rb::CURRENT_TIME)?
+        .check()
+        .context("Failed to focus window")?;
     Ok(())
 }
 
@@ -663,8 +671,8 @@ pub struct WindowManager {
 
 impl WindowManager {
     pub fn new(display: &str) -> Result<Self> {
-        let (conn, _screen_num) =
-            RustConnection::connect(Some(display)).context("Failed to connect to X11 for window management")?;
+        let (conn, _screen_num) = RustConnection::connect(Some(display))
+            .context("Failed to connect to X11 for window management")?;
         let atoms = Atoms::intern(&conn)?;
         Ok(Self { conn, atoms })
     }

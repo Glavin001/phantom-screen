@@ -77,8 +77,9 @@ async fn main() -> Result<()> {
 
     // Initialize coherence mode support (window monitor + pipeline manager)
     let coherence_state = {
-        let (window_rx, tracked_windows, _monitor_handle) = window_monitor::start_window_monitor(&config.display)
-            .context("Failed to start window monitor")?;
+        let (window_rx, tracked_windows, _monitor_handle) =
+            window_monitor::start_window_monitor(&config.display)
+                .context("Failed to start window monitor")?;
         // The monitor handle is moved into a leaked box so it lives for the process lifetime.
         // This is fine since we shut down via process exit.
         let _handle = Box::leak(Box::new(_monitor_handle));
@@ -465,18 +466,34 @@ async fn process_input_data_with_coherence(
                                                 if !seen_keyframe {
                                                     if frame.is_keyframe {
                                                         seen_keyframe = true;
-                                                        info!("Window {} sender: first keyframe ({} bytes), skipped {} deltas", wid, frame.data.len(), delta_skip_count);
+                                                        info!(
+                                                            "Window {} sender: first keyframe ({} bytes), skipped {} deltas",
+                                                            wid,
+                                                            frame.data.len(),
+                                                            delta_skip_count
+                                                        );
                                                     } else {
                                                         delta_skip_count += 1;
                                                         if delta_skip_count <= 3 {
-                                                            info!("Window {} sender: skipping delta #{} ({} bytes)", wid, delta_skip_count, frame.data.len());
+                                                            info!(
+                                                                "Window {} sender: skipping delta #{} ({} bytes)",
+                                                                wid,
+                                                                delta_skip_count,
+                                                                frame.data.len()
+                                                            );
                                                         }
                                                         continue;
                                                     }
                                                 }
                                                 frame_count += 1;
                                                 if frame_count <= 5 {
-                                                    info!("Window {} sender frame #{}: {} bytes, keyframe={}", wid, frame_count, frame.data.len(), frame.is_keyframe);
+                                                    info!(
+                                                        "Window {} sender frame #{}: {} bytes, keyframe={}",
+                                                        wid,
+                                                        frame_count,
+                                                        frame.data.len(),
+                                                        frame.is_keyframe
+                                                    );
                                                 }
                                                 if let Err(e) = coherence::send_window_video_frame(
                                                     &session_clone,
@@ -505,7 +522,10 @@ async fn process_input_data_with_coherence(
                                             }
                                         }
                                     }
-                                    info!("Window {} sender task ENDED (sent {} frames)", wid, frame_count);
+                                    info!(
+                                        "Window {} sender task ENDED (sent {} frames)",
+                                        wid, frame_count
+                                    );
                                 });
                                 cs.track_sender(wid, handle);
                             }

@@ -25,7 +25,9 @@ pub struct CoherenceState {
 impl CoherenceState {
     /// Get the current window list as a snapshot event.
     pub fn current_snapshot(&self) -> WindowEvent {
-        let windows = self.tracked_windows.lock()
+        let windows = self
+            .tracked_windows
+            .lock()
             .map(|tracked| tracked.values().cloned().collect())
             .unwrap_or_default();
         WindowEvent::Snapshot(windows)
@@ -68,7 +70,10 @@ impl CoherenceSession {
             info!("Window {} unsubscribe: ABORTING sender task", window_id);
             handle.abort();
         } else {
-            warn!("Window {} unsubscribe: NO sender task found in subscriptions!", window_id);
+            warn!(
+                "Window {} unsubscribe: NO sender task found in subscriptions!",
+                window_id
+            );
         }
         info!("Session unsubscribed from window {}", window_id);
     }
@@ -76,10 +81,16 @@ impl CoherenceSession {
     /// Track a frame sender task for a window.
     pub fn track_sender(&mut self, window_id: u32, handle: JoinHandle<()>) {
         if let Some(old) = self.subscriptions.insert(window_id, handle) {
-            info!("Window {} track_sender: ABORTING old sender task", window_id);
+            info!(
+                "Window {} track_sender: ABORTING old sender task",
+                window_id
+            );
             old.abort();
         } else {
-            info!("Window {} track_sender: no previous sender (first subscribe)", window_id);
+            info!(
+                "Window {} track_sender: no previous sender (first subscribe)",
+                window_id
+            );
         }
     }
 
@@ -179,10 +190,7 @@ pub fn serialize_window_event(event: &WindowEvent) -> Vec<u8> {
             buf.extend_from_slice(title_bytes);
             buf
         }
-        WindowEvent::VisibilityChanged {
-            window_id,
-            visible,
-        } => {
+        WindowEvent::VisibilityChanged { window_id, visible } => {
             let mut buf = vec![0x40, 0x06];
             buf.extend_from_slice(&window_id.to_be_bytes());
             buf.push(if *visible { 1 } else { 0 });
