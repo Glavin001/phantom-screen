@@ -127,6 +127,7 @@ pub struct PipelineManager {
     input_handler: Option<Arc<InputHandler>>,
     post_start_command: Option<String>,
     pre_resize_hooks: Mutex<Vec<PreResizeHook>>,
+    post_resize_hooks: Mutex<Vec<PreResizeHook>>,
 }
 
 impl PipelineManager {
@@ -134,6 +135,12 @@ impl PipelineManager {
     /// Use this to stop per-window pipelines or other X clients.
     pub fn add_pre_resize_hook(&self, hook: PreResizeHook) {
         self.pre_resize_hooks.lock().unwrap().push(hook);
+    }
+
+    /// Register a hook that runs after resize completes (new pipeline is running).
+    /// Use this to reconnect X clients to the new display.
+    pub fn add_post_resize_hook(&self, hook: PreResizeHook) {
+        self.post_resize_hooks.lock().unwrap().push(hook);
     }
 
     /// Resize the display and restart the pipeline.
@@ -224,6 +231,15 @@ impl PipelineManager {
         let _ = self.frame_watch_tx.send(new_tx);
 
         tracing::info!("Pipeline restarted at {}x{}", width, height);
+
+        // Run post-resize hooks (e.g., reconnect WindowManager)
+        {
+            let hooks = self.post_resize_hooks.lock().unwrap();
+            for hook in hooks.iter() {
+                hook();
+            }
+        }
+
         Ok(())
     }
 
@@ -326,6 +342,7 @@ impl PipelineManager {
             input_handler: None,
             post_start_command: None,
             pre_resize_hooks: Mutex::new(Vec::new()),
+            post_resize_hooks: Mutex::new(Vec::new()),
         })
     }
 }
@@ -429,6 +446,7 @@ pub fn start_pipeline(
         input_handler,
         post_start_command,
         pre_resize_hooks: Mutex::new(Vec::new()),
+        post_resize_hooks: Mutex::new(Vec::new()),
     });
 
     Ok((frame_rx, manager))

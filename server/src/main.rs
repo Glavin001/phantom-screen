@@ -104,13 +104,21 @@ async fn main() -> Result<()> {
         // Forward window monitor events to the broadcast channel.
         // The monitor thread auto-reconnects after Xvfb restarts, so
         // this forwarder keeps running for the lifetime of the process.
+        let composite_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
         let tx_clone = window_event_tx.clone();
         let tracked_for_forwarder = tracked_windows.clone();
+        let composite_ready_for_forwarder = composite_ready.clone();
         tokio::spawn(async move {
             let mut rx = window_rx;
             loop {
                 match rx.recv().await {
                     Ok(event) => {
+                        // Snapshot means window monitor reconnected and Composite is re-enabled
+                        if matches!(&event, window_monitor::WindowEvent::Snapshot(_)) {
+                            composite_ready_for_forwarder
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
                         let _ = tx_clone.send(event);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -141,6 +149,7 @@ async fn main() -> Result<()> {
             tracked_windows,
             pipeline_manager,
             window_manager,
+            composite_ready,
         })
     };
     info!("Coherence mode support initialized");
@@ -150,7 +159,15 @@ async fn main() -> Result<()> {
     // would trigger fatal XIO errors when the X server goes away.
     {
         let wpm = coherence_state.pipeline_manager.clone();
+        let composite_ready = coherence_state.composite_ready.clone();
+        let window_events_tx = coherence_state.window_events.clone();
         pipeline_manager.add_pre_resize_hook(Box::new(move || {
+            // Mark Composite as not ready — block new per-window pipeline starts
+            composite_ready.store(false, std::sync::atomic::Ordering::Release);
+
+            // Broadcast empty snapshot so clients know all window IDs are invalidated
+            let _ = window_events_tx.send(window_monitor::WindowEvent::Snapshot(vec![]));
+
             if let Ok(mut mgr) = wpm.try_lock() {
                 let count = mgr.active_count();
                 if count > 0 {
@@ -162,6 +179,16 @@ async fn main() -> Result<()> {
                 }
             } else {
                 tracing::warn!("Pre-resize: could not lock window pipeline manager");
+            }
+        }));
+    }
+
+    // Register post-resize hook: reconnect WindowManager to the new X server.
+    {
+        let wm = coherence_state.window_manager.clone();
+        pipeline_manager.add_post_resize_hook(Box::new(move || {
+            if let Err(e) = wm.reconnect() {
+                tracing::error!("Post-resize: failed to reconnect WindowManager: {}", e);
             }
         }));
     }
@@ -627,6 +654,15 @@ async fn process_input_data_with_coherence(
                     }
                 }
                 InputEvent::SubscribeWindow { window_id } => {
+                    if !coherence_state
+                        .composite_ready
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        warn!(
+                            "Window {} subscribe rejected: Composite not ready (display resizing)",
+                            window_id
+                        );
+                    } else {
                     let mut cs_lock = coherence_session.lock().await;
                     if let Some(ref mut cs) = *cs_lock {
                         let wid = *window_id;
@@ -713,6 +749,7 @@ async fn process_input_data_with_coherence(
                             }
                         }
                     }
+                    } // else composite_ready
                 }
                 InputEvent::UnsubscribeWindow { window_id } => {
                     let mut cs_lock = coherence_session.lock().await;

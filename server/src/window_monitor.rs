@@ -693,28 +693,51 @@ pub fn close_window(conn: &RustConnection, window: u32, atoms: &Atoms) -> Result
 
 /// Public interface for window management operations from coherence sessions.
 pub struct WindowManager {
-    conn: RustConnection,
-    atoms: Atoms,
+    display: String,
+    conn: std::sync::Mutex<RustConnection>,
+    atoms: std::sync::Mutex<Atoms>,
 }
 
 impl WindowManager {
     pub fn new(display: &str) -> Result<Self> {
+        let (conn, atoms) = Self::connect(display)?;
+        Ok(Self {
+            display: display.to_string(),
+            conn: std::sync::Mutex::new(conn),
+            atoms: std::sync::Mutex::new(atoms),
+        })
+    }
+
+    /// Reconnect to the X11 display after an Xvfb restart.
+    pub fn reconnect(&self) -> Result<()> {
+        let (conn, atoms) = Self::connect(&self.display)?;
+        *self.conn.lock().unwrap() = conn;
+        *self.atoms.lock().unwrap() = atoms;
+        tracing::info!("WindowManager reconnected to display {}", self.display);
+        Ok(())
+    }
+
+    fn connect(display: &str) -> Result<(RustConnection, Atoms)> {
         let (conn, _screen_num) = RustConnection::connect(Some(display))
             .context("Failed to connect to X11 for window management")?;
         let atoms = Atoms::intern(&conn)?;
-        Ok(Self { conn, atoms })
+        Ok((conn, atoms))
     }
 
     pub fn resize(&self, window_id: u32, width: u16, height: u16) -> Result<()> {
-        resize_window(&self.conn, window_id, width, height)
+        let conn = self.conn.lock().unwrap();
+        resize_window(&conn, window_id, width, height)
     }
 
     pub fn raise(&self, window_id: u32) -> Result<()> {
-        raise_window(&self.conn, window_id)
+        let conn = self.conn.lock().unwrap();
+        raise_window(&conn, window_id)
     }
 
     pub fn close(&self, window_id: u32) -> Result<()> {
-        close_window(&self.conn, window_id, &self.atoms)
+        let conn = self.conn.lock().unwrap();
+        let atoms = self.atoms.lock().unwrap();
+        close_window(&conn, window_id, &atoms)
     }
 }
 

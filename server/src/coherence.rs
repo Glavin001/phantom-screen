@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -20,6 +21,9 @@ pub struct CoherenceState {
     pub tracked_windows: TrackedWindows,
     pub pipeline_manager: Arc<Mutex<WindowPipelineManager>>,
     pub window_manager: Arc<WindowManager>,
+    /// Set to false during resize (before Xvfb kill), set to true when window
+    /// monitor reconnects and re-enables Composite (on Snapshot event).
+    pub composite_ready: Arc<AtomicBool>,
 }
 
 impl CoherenceState {
