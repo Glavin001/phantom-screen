@@ -267,7 +267,10 @@ fn run_monitor_session(
     enumerate_windows(&conn, root, &atoms, &mut tracked)?;
 
     let snapshot: Vec<WindowInfo> = tracked.values().cloned().collect();
-    tracing::info!("Window monitor reconnected, found {} windows", snapshot.len());
+    tracing::info!(
+        "Window monitor reconnected, found {} windows",
+        snapshot.len()
+    );
     // Update shared state so late subscribers can get a fresh snapshot
     if let Ok(mut shared) = shared_tracked.lock() {
         *shared = tracked.clone();

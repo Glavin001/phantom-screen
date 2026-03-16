@@ -66,7 +66,10 @@ pub struct Config {
     pub stream_resolution: Option<String>,
 
     /// Applications available for quick launch in coherence mode (comma-separated)
-    #[arg(long, default_value = "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad")]
+    #[arg(
+        long,
+        default_value = "xterm,firefox,chromium --no-sandbox --disable-gpu,l3afpad"
+    )]
     pub launch_apps: String,
 
     /// Per-window encoder bitrate in kbps for coherence mode

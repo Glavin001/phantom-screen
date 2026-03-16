@@ -171,10 +171,7 @@ async fn main() -> Result<()> {
             if let Ok(mut mgr) = wpm.try_lock() {
                 let count = mgr.active_count();
                 if count > 0 {
-                    tracing::info!(
-                        "Pre-resize: stopping {} per-window pipeline(s)",
-                        count
-                    );
+                    tracing::info!("Pre-resize: stopping {} per-window pipeline(s)", count);
                     mgr.stop_all();
                 }
             } else {
@@ -392,9 +389,7 @@ fn install_xlib_error_handler() {
         0
     }
 
-    unsafe extern "C" fn non_fatal_io_error_handler(
-        _display: *mut std::ffi::c_void,
-    ) -> i32 {
+    unsafe extern "C" fn non_fatal_io_error_handler(_display: *mut std::ffi::c_void) -> i32 {
         // This fires when the X connection breaks (e.g., Xvfb killed for resize).
         // We MUST NOT return — Xlib calls _exit(1) after this handler returns,
         // regardless of the return value. This is by Xlib spec and cannot be
@@ -663,18 +658,18 @@ async fn process_input_data_with_coherence(
                             window_id
                         );
                     } else {
-                    let mut cs_lock = coherence_session.lock().await;
-                    if let Some(ref mut cs) = *cs_lock {
-                        let wid = *window_id;
-                        match cs.subscribe_window(wid).await {
-                            Ok(rx) => {
-                                spawn_window_sender(wid, rx, &session, cs);
-                            }
-                            Err(e) => {
-                                warn!("Failed to subscribe to window {}: {}", wid, e);
+                        let mut cs_lock = coherence_session.lock().await;
+                        if let Some(ref mut cs) = *cs_lock {
+                            let wid = *window_id;
+                            match cs.subscribe_window(wid).await {
+                                Ok(rx) => {
+                                    spawn_window_sender(wid, rx, &session, cs);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to subscribe to window {}: {}", wid, e);
+                                }
                             }
                         }
-                    }
                     } // else composite_ready
                 }
                 InputEvent::UnsubscribeWindow { window_id } => {
@@ -831,7 +826,9 @@ fn spawn_window_sender(
                             if delta_skip_count <= 3 {
                                 info!(
                                     "Window {} sender: skipping delta #{} ({} bytes)",
-                                    wid, delta_skip_count, frame.data.len()
+                                    wid,
+                                    delta_skip_count,
+                                    frame.data.len()
                                 );
                             }
                             continue;
@@ -841,7 +838,10 @@ fn spawn_window_sender(
                     if frame_count <= 5 {
                         info!(
                             "Window {} sender frame #{}: {} bytes, keyframe={}",
-                            wid, frame_count, frame.data.len(), frame.is_keyframe
+                            wid,
+                            frame_count,
+                            frame.data.len(),
+                            frame.is_keyframe
                         );
                     }
                     if let Err(e) =

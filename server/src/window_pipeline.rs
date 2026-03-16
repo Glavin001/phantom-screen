@@ -250,7 +250,12 @@ fn validate_window_exists(x_display: &str, window_id: u32) -> bool {
         Ok(cookie) => match cookie.reply() {
             Ok(_) => true,
             Err(e) => {
-                tracing::warn!("Window 0x{:x} does not exist on {}: {}", window_id, x_display, e);
+                tracing::warn!(
+                    "Window 0x{:x} does not exist on {}: {}",
+                    window_id,
+                    x_display,
+                    e
+                );
                 false
             }
         },
