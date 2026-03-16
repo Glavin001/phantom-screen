@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use crate::input::InputEvent;
-use crate::pipeline::PipelineManager;
+use crate::pipeline::{PipelineManager, pack_display_size};
 
 /// Handle control events from the client.
 /// `display_size` is an optional packed (width<<16|height) atomic updated after
@@ -28,7 +28,7 @@ pub fn handle_control_event(
                 // PipelineManager rounds to even, so read the actual value back.
                 let (w, h) = manager.current_resolution();
                 ds.store(
-                    (u32::from(w) << 16) | u32::from(h),
+                    pack_display_size(w, h),
                     std::sync::atomic::Ordering::Release,
                 );
                 tracing::info!(

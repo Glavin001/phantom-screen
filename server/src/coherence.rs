@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::pipeline::EncodedFrame;
+use crate::pipeline::{EncodedFrame, clamp_to_display, round_to_even, unpack_display_size};
 use crate::window_monitor::{TrackedWindows, WindowEvent, WindowManager};
 use crate::window_pipeline::WindowPipelineManager;
 
@@ -116,18 +116,16 @@ impl CoherenceSession {
         // Round up to even dimensions — x264enc / I420 (4:2:0 chroma subsampling)
         // requires even width and height; odd values cause silent cap negotiation
         // failure resulting in 0 fps (black screen).
-        let mut width = (width + 1) & !1;
-        let mut height = (height + 1) & !1;
+        let mut width = round_to_even(width);
+        let mut height = round_to_even(height);
 
         // Clamp to the current display dimensions — a window exceeding the Xvfb
         // display bounds causes Composite BadMatch errors every frame, resulting
         // in black/corrupt captures.
-        let packed = self.display_size.load(std::sync::atomic::Ordering::Relaxed);
-        let display_w = (packed >> 16) as u16;
-        let display_h = (packed & 0xFFFF) as u16;
-        if display_w > 0 && display_h > 0 && (width > display_w || height > display_h) {
-            let clamped_w = width.min(display_w);
-            let clamped_h = height.min(display_h);
+        let packed = self.display_size.load(std::sync::atomic::Ordering::Acquire);
+        let (display_w, display_h) = unpack_display_size(packed);
+        let (clamped_w, clamped_h) = clamp_to_display(width, height, display_w, display_h);
+        if clamped_w != width || clamped_h != height {
             info!(
                 "Clamping window {} resize from {}x{} to {}x{} (display is {}x{})",
                 window_id, width, height, clamped_w, clamped_h, display_w, display_h
@@ -371,5 +369,56 @@ mod tests {
         assert_eq!(data[0], 0x40);
         assert_eq!(data[1], 0x06);
         assert_eq!(data[6], 0); // not visible
+    }
+
+    // --- Resize dimension processing tests ---
+    // These test the full pipeline: round_to_even → clamp_to_display
+
+    #[test]
+    fn resize_dimensions_odd_rounded_then_clamped() {
+        // Odd 1921x1081 → rounds to 1922x1082 → clamped to 1920x1080
+        let w = round_to_even(1921);
+        let h = round_to_even(1081);
+        assert_eq!((w, h), (1922, 1082));
+        let (cw, ch) = clamp_to_display(w, h, 1920, 1080);
+        assert_eq!((cw, ch), (1920, 1080));
+    }
+
+    #[test]
+    fn resize_dimensions_zero_gets_minimum() {
+        let w = round_to_even(0);
+        let h = round_to_even(0);
+        assert_eq!((w, h), (2, 2));
+        // Within any reasonable display
+        let (cw, ch) = clamp_to_display(w, h, 1920, 1080);
+        assert_eq!((cw, ch), (2, 2));
+    }
+
+    #[test]
+    fn resize_dimensions_u16_max_rounded_and_clamped() {
+        // u16::MAX (65535) → rounds to 65534 → clamped to display
+        let w = round_to_even(u16::MAX);
+        let h = round_to_even(u16::MAX);
+        assert_eq!((w, h), (65534, 65534));
+        let (cw, ch) = clamp_to_display(w, h, 1920, 1080);
+        assert_eq!((cw, ch), (1920, 1080));
+    }
+
+    #[test]
+    fn resize_dimensions_display_uninitialized_passthrough() {
+        // When display_size hasn't been set (packed=0), don't clamp
+        let (dw, dh) = crate::pipeline::unpack_display_size(0);
+        assert_eq!((dw, dh), (0, 0));
+        let (cw, ch) = clamp_to_display(800, 600, dw, dh);
+        assert_eq!((cw, ch), (800, 600));
+    }
+
+    #[test]
+    fn resize_dimensions_within_display_unchanged() {
+        let w = round_to_even(800);
+        let h = round_to_even(600);
+        assert_eq!((w, h), (800, 600));
+        let (cw, ch) = clamp_to_display(w, h, 1920, 1080);
+        assert_eq!((cw, ch), (800, 600));
     }
 }

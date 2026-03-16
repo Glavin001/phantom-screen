@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
         let initial_w = config.resolution_width();
         let initial_h = config.resolution_height();
         let display_size = Arc::new(std::sync::atomic::AtomicU32::new(
-            (initial_w << 16) | (initial_h & 0xFFFF),
+            pipeline::pack_display_size(initial_w as u16, initial_h as u16),
         ));
 
         Arc::new(coherence::CoherenceState {
@@ -161,6 +161,10 @@ async fn main() -> Result<()> {
         })
     };
     info!("Coherence mode support initialized");
+
+    // Wire display_size into PipelineManager so it's updated atomically during
+    // resize (before post-resize hooks), preventing stale clamping values.
+    pipeline_manager.set_display_size(coherence_state.display_size.clone());
 
     // Register pre-resize hook: stop all per-window pipelines before Xvfb is killed.
     // This prevents GStreamer's ximagesrc from holding open Xlib connections that
@@ -735,8 +739,15 @@ async fn process_input_data_with_coherence(
                     width,
                     height,
                 } => {
-                    let mut cs_lock = coherence_session.lock().await;
-                    if let Some(ref mut cs) = *cs_lock {
+                    if !coherence_state
+                        .composite_ready
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        warn!(
+                            "Window {} resize rejected: Composite not ready (display resizing)",
+                            window_id
+                        );
+                    } else if let Some(ref mut cs) = *coherence_session.lock().await {
                         let wid = *window_id;
                         match cs.resize_window(wid, *width, *height).await {
                             Ok(Some(rx)) => {

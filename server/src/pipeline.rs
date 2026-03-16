@@ -10,6 +10,32 @@ use tokio::sync::{broadcast, watch};
 use crate::config::{Config, EncoderType, detect_encoder};
 use crate::input::InputHandler;
 
+/// Round a dimension to even (required by x264enc/I420 for 4:2:0 chroma subsampling).
+/// Uses saturating arithmetic to prevent u16 overflow and enforces a minimum of 2.
+pub fn round_to_even(dim: u16) -> u16 {
+    (dim.saturating_add(1) & !1).max(2)
+}
+
+/// Pack display dimensions into a single u32 for atomic sharing.
+pub fn pack_display_size(width: u16, height: u16) -> u32 {
+    (u32::from(width) << 16) | u32::from(height)
+}
+
+/// Unpack display dimensions from a packed u32.
+pub fn unpack_display_size(packed: u32) -> (u16, u16) {
+    ((packed >> 16) as u16, (packed & 0xFFFF) as u16)
+}
+
+/// Clamp dimensions to display bounds. Returns the (possibly clamped) width and height.
+/// If display dimensions are zero (uninitialized), returns the original values.
+pub fn clamp_to_display(width: u16, height: u16, display_w: u16, display_h: u16) -> (u16, u16) {
+    if display_w > 0 && display_h > 0 && (width > display_w || height > display_h) {
+        (width.min(display_w), height.min(display_h))
+    } else {
+        (width, height)
+    }
+}
+
 /// Query the current resolution of an X11 display using xdpyinfo.
 ///
 /// Returns `(width, height)` or an error if the display cannot be queried.
@@ -128,9 +154,19 @@ pub struct PipelineManager {
     post_start_command: Option<String>,
     pre_resize_hooks: Mutex<Vec<PreResizeHook>>,
     post_resize_hooks: Mutex<Vec<PreResizeHook>>,
+    /// Packed display dimensions (width << 16 | height) shared with coherence
+    /// for clamping per-window sizes. Updated atomically during resize before
+    /// post-resize hooks run, preventing a window between Xvfb restart and
+    /// display_size update where stale values could allow oversized windows.
+    display_size: Mutex<Option<Arc<AtomicU32>>>,
 }
 
 impl PipelineManager {
+    /// Set the shared display_size atomic for coherence mode clamping.
+    pub fn set_display_size(&self, ds: Arc<AtomicU32>) {
+        *self.display_size.lock().unwrap() = Some(ds);
+    }
+
     /// Register a hook that runs before Xvfb is killed for resize.
     /// Use this to stop per-window pipelines or other X clients.
     pub fn add_pre_resize_hook(&self, hook: PreResizeHook) {
@@ -152,8 +188,8 @@ impl PipelineManager {
     pub fn resize(&self, width: u16, height: u16) -> Result<()> {
         // Round up to even dimensions — x264enc/I420 require even width and height
         // for 4:2:0 chroma subsampling.
-        let width = (width + 1) & !1;
-        let height = (height + 1) & !1;
+        let width = round_to_even(width);
+        let height = round_to_even(height);
 
         let mut config = self.config.lock().unwrap();
         let current_w = config.resolution_width() as u16;
@@ -197,10 +233,13 @@ impl PipelineManager {
         // Resize the virtual display (kills and restarts Xvfb)
         resize_display(&config.display, width, height)?;
 
-        // Update config
+        // Update config and display_size atomically (before post-resize hooks)
+        // so coherence clamping sees the new dimensions immediately.
         config.resolution = format!("{}x{}", width, height);
-        // Clear stream_resolution so new pipeline captures at native size
         config.stream_resolution = None;
+        if let Some(ref ds) = *self.display_size.lock().unwrap() {
+            ds.store(pack_display_size(width, height), Ordering::Release);
+        }
 
         // Brief pause for X server to settle after resize
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -253,9 +292,9 @@ impl PipelineManager {
     /// Use this when the display resolution changed externally (e.g. xrandr)
     /// and the pipeline needs to re-capture at the new size.
     pub fn restart_pipeline(&self, new_width: u16, new_height: u16) -> Result<()> {
-        // Round up to even dimensions — x264enc/I420 require even width and height
-        let new_width = (new_width + 1) & !1;
-        let new_height = (new_height + 1) & !1;
+        // Round up to even dimensions — x264enc/I420 require even width and height.
+        let new_width = round_to_even(new_width);
+        let new_height = round_to_even(new_height);
 
         let mut config = self.config.lock().unwrap();
 
@@ -361,6 +400,7 @@ impl PipelineManager {
             post_start_command: None,
             pre_resize_hooks: Mutex::new(Vec::new()),
             post_resize_hooks: Mutex::new(Vec::new()),
+            display_size: Mutex::new(None),
         })
     }
 }
@@ -464,6 +504,7 @@ pub fn start_pipeline(
         post_start_command,
         pre_resize_hooks: Mutex::new(Vec::new()),
         post_resize_hooks: Mutex::new(Vec::new()),
+        display_size: Mutex::new(None),
     });
 
     Ok((frame_rx, manager))
@@ -791,5 +832,139 @@ mod tests {
                 "Missing alignment=au for {encoder:?}"
             );
         }
+    }
+
+    // --- Even-dimension rounding tests ---
+
+    #[test]
+    fn round_to_even_odd_values() {
+        assert_eq!(round_to_even(1), 2);
+        assert_eq!(round_to_even(3), 4);
+        assert_eq!(round_to_even(99), 100);
+        assert_eq!(round_to_even(1079), 1080);
+        assert_eq!(round_to_even(1919), 1920);
+    }
+
+    #[test]
+    fn round_to_even_even_values() {
+        assert_eq!(round_to_even(2), 2);
+        assert_eq!(round_to_even(4), 4);
+        assert_eq!(round_to_even(100), 100);
+        assert_eq!(round_to_even(1080), 1080);
+        assert_eq!(round_to_even(1920), 1920);
+    }
+
+    #[test]
+    fn round_to_even_zero_returns_minimum() {
+        // Zero dimensions would cause X11/GStreamer errors; must clamp to 2
+        assert_eq!(round_to_even(0), 2);
+    }
+
+    #[test]
+    fn round_to_even_one_returns_two() {
+        assert_eq!(round_to_even(1), 2);
+    }
+
+    #[test]
+    fn round_to_even_u16_max_no_overflow() {
+        // u16::MAX = 65535 (odd). Without saturating_add, (65535 + 1) overflows
+        // to 0, then & !1 = 0, producing a zero-dimension window.
+        // With the fix, saturating_add(1) = 65535, & !1 = 65534.
+        assert_eq!(round_to_even(u16::MAX), 65534);
+    }
+
+    #[test]
+    fn round_to_even_u16_max_minus_one() {
+        // 65534 is already even
+        assert_eq!(round_to_even(u16::MAX - 1), 65534);
+    }
+
+    // --- Display size packing/unpacking tests ---
+
+    #[test]
+    fn pack_unpack_display_size_round_trip() {
+        let cases = [(1920, 1080), (1280, 720), (3840, 2160), (1, 1), (0, 0)];
+        for (w, h) in cases {
+            let packed = pack_display_size(w, h);
+            let (uw, uh) = unpack_display_size(packed);
+            assert_eq!((uw, uh), (w, h), "Round-trip failed for {}x{}", w, h);
+        }
+    }
+
+    #[test]
+    fn pack_unpack_max_dimensions() {
+        let packed = pack_display_size(u16::MAX, u16::MAX);
+        let (w, h) = unpack_display_size(packed);
+        assert_eq!(w, u16::MAX);
+        assert_eq!(h, u16::MAX);
+    }
+
+    #[test]
+    fn pack_display_size_independent_fields() {
+        // Verify width and height don't bleed into each other
+        let packed = pack_display_size(0xFF00, 0x00FF);
+        let (w, h) = unpack_display_size(packed);
+        assert_eq!(w, 0xFF00);
+        assert_eq!(h, 0x00FF);
+    }
+
+    // --- Display bounds clamping tests ---
+
+    #[test]
+    fn clamp_to_display_within_bounds() {
+        let (w, h) = clamp_to_display(800, 600, 1920, 1080);
+        assert_eq!((w, h), (800, 600));
+    }
+
+    #[test]
+    fn clamp_to_display_exceeds_width() {
+        let (w, h) = clamp_to_display(2000, 600, 1920, 1080);
+        assert_eq!((w, h), (1920, 600));
+    }
+
+    #[test]
+    fn clamp_to_display_exceeds_height() {
+        let (w, h) = clamp_to_display(800, 1200, 1920, 1080);
+        assert_eq!((w, h), (800, 1080));
+    }
+
+    #[test]
+    fn clamp_to_display_exceeds_both() {
+        let (w, h) = clamp_to_display(2000, 1200, 1920, 1080);
+        assert_eq!((w, h), (1920, 1080));
+    }
+
+    #[test]
+    fn clamp_to_display_exact_match() {
+        let (w, h) = clamp_to_display(1920, 1080, 1920, 1080);
+        assert_eq!((w, h), (1920, 1080));
+    }
+
+    #[test]
+    fn clamp_to_display_zero_display_passthrough() {
+        // Zero display dimensions (uninitialized) should not clamp
+        let (w, h) = clamp_to_display(2000, 1200, 0, 0);
+        assert_eq!((w, h), (2000, 1200));
+    }
+
+    #[test]
+    fn clamp_to_display_zero_width_only_passthrough() {
+        // Only one dimension zero — still passthrough (both must be > 0)
+        let (w, h) = clamp_to_display(2000, 1200, 0, 1080);
+        assert_eq!((w, h), (2000, 1200));
+    }
+
+    // --- Display size atomic update in PipelineManager ---
+
+    #[test]
+    fn pipeline_manager_set_display_size() {
+        let pm = PipelineManager::new_for_test(true);
+        let ds = Arc::new(AtomicU32::new(0));
+        pm.set_display_size(ds.clone());
+
+        // Verify it was stored
+        let stored = pm.display_size.lock().unwrap();
+        assert!(stored.is_some());
+        assert_eq!(stored.as_ref().unwrap().load(Ordering::Relaxed), 0);
     }
 }
