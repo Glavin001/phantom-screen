@@ -205,8 +205,8 @@ else
 fi
 
 # ---- Test: Window monitor detected windows ----
-if echo "$CONTAINER_LOGS" | grep -q "Window monitor started, found [0-9]"; then
-  WINDOW_COUNT=$(echo "$CONTAINER_LOGS" | grep "Window monitor started" | grep -oE "found [0-9]+" | grep -oE "[0-9]+")
+if echo "$CONTAINER_LOGS" | grep -qE "Window monitor (started|reconnected), found [0-9]+"; then
+  WINDOW_COUNT=$(echo "$CONTAINER_LOGS" | grep -E "Window monitor (started|reconnected)" | grep -oE "found [0-9]+" | grep -oE "[0-9]+" | head -1)
   if [ "${WINDOW_COUNT:-0}" -ge 1 ]; then
     log_pass "Window monitor detected $WINDOW_COUNT window(s)"
   else
@@ -309,7 +309,7 @@ if [ -n "$BACK_WINDOW_ID" ] && [ "$BACK_WINDOW_ID" != "0" ]; then
     echo EXIT_CODE=\$?
   " 2>&1 || echo "EXIT_CODE=1")
 
-  CAPTURE_EXIT=$(echo "$CAPTURE_RESULT" | grep -oP 'EXIT_CODE=\K[0-9]+' || echo "1")
+  CAPTURE_EXIT=$(echo "$CAPTURE_RESULT" | grep -oE 'EXIT_CODE=[0-9]+' | tail -1 | grep -oE '[0-9]+' || echo "1")
 
   if [ "$CAPTURE_EXIT" = "0" ] && docker exec "$CONTAINER_NAME" test -f /tmp/back_window_capture.raw; then
     # Check the raw pixel data: a fully black image would be all zero bytes.
@@ -352,7 +352,7 @@ if [ -n "$FRONT_WINDOW_ID" ] && [ "$FRONT_WINDOW_ID" != "0" ] && [ "$FRONT_WINDO
     echo EXIT_CODE=\$?
   " 2>&1 || echo "EXIT_CODE=1")
 
-  FRONT_EXIT=$(echo "$FRONT_CAPTURE_RESULT" | grep -oP 'EXIT_CODE=\K[0-9]+' || echo "1")
+  FRONT_EXIT=$(echo "$FRONT_CAPTURE_RESULT" | grep -oE 'EXIT_CODE=[0-9]+' | tail -1 | grep -oE '[0-9]+' || echo "1")
   if [ "$FRONT_EXIT" = "0" ] && docker exec "$CONTAINER_NAME" test -f /tmp/front_window_capture.raw; then
     FRONT_NONZERO=$(docker exec "$CONTAINER_NAME" sh -c '
       od -An -tx1 /tmp/front_window_capture.raw | tr " " "\n" | grep -cv "^00$" 2>/dev/null || echo "0"

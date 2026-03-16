@@ -118,7 +118,7 @@ export class WindowPopup {
     const titleBar = document.createElement('div');
     titleBar.className = 'phantom-screen-inline-titlebar';
     titleBar.innerHTML = `
-      <span class="phantom-screen-inline-title">${this.escapeHtml(info.title || info.appClass || 'Window')} [${info.windowId}]</span>
+      <span class="phantom-screen-inline-title">${this.escapeHtml(info.title || info.appClass || 'Window')}</span>
       <button class="phantom-screen-inline-close" title="Close stream">&times;</button>
     `;
     this.container.appendChild(titleBar);
@@ -177,15 +177,11 @@ export class WindowPopup {
     const style = doc.createElement('style');
     style.textContent = `* { margin: 0; padding: 0; box-sizing: border-box; }
       html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
-      .phantom-screen-popup-wid { position: absolute; top: 4px; left: 4px; z-index: 1; font: 11px monospace; color: rgba(255,255,255,0.8); pointer-events: none; }
       canvas { width: 100%; height: 100%; display: block; cursor: default; }`;
     doc.head.appendChild(style);
 
-    const widLabel = doc.createElement('div');
-    widLabel.className = 'phantom-screen-popup-wid';
-    widLabel.textContent = `Window ${info.windowId}`;
-    doc.body.appendChild(widLabel);
-
+    // location=no requests no URL bar; many browsers ignore it and still show
+    // about:blank. For a UI with no browser chrome, use inline mode or your own UI.
     const canvas = doc.createElement('canvas');
     canvas.id = 'stream-canvas';
     canvas.tabIndex = 0;
