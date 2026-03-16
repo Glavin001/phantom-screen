@@ -98,9 +98,30 @@ impl CoherenceSession {
         }
     }
 
-    /// Resize a remote X11 window.
-    pub fn resize_window(&self, window_id: u32, width: u16, height: u16) -> Result<()> {
-        self.window_manager.resize(window_id, width, height)
+    /// Resize a remote X11 window and restart its per-window pipeline
+    /// so ximagesrc captures at the new dimensions.
+    pub async fn resize_window(
+        &self,
+        window_id: u32,
+        width: u16,
+        height: u16,
+    ) -> Result<Option<broadcast::Receiver<EncodedFrame>>> {
+        self.window_manager.resize(window_id, width, height)?;
+
+        // Restart the per-window pipeline if it's currently streaming,
+        // since ximagesrc negotiates caps once at startup and won't
+        // pick up the new window size automatically.
+        let mut mgr = self.pipeline_manager.lock().await;
+        if mgr.is_streaming(window_id) {
+            let rx = mgr.restart_window(window_id)?;
+            info!(
+                "Restarted per-window pipeline for window {} at {}x{}",
+                window_id, width, height
+            );
+            Ok(Some(rx))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Focus/raise a remote X11 window.

@@ -667,82 +667,8 @@ async fn process_input_data_with_coherence(
                     if let Some(ref mut cs) = *cs_lock {
                         let wid = *window_id;
                         match cs.subscribe_window(wid).await {
-                            Ok(mut rx) => {
-                                let session_clone = session.clone();
-                                let handle = tokio::spawn(async move {
-                                    info!("Window {} sender task STARTED", wid);
-                                    let mut seen_keyframe = false;
-                                    let mut frame_count: u64 = 0;
-                                    let mut delta_skip_count: u64 = 0;
-                                    loop {
-                                        match rx.recv().await {
-                                            Ok(frame) => {
-                                                // Keyframe gating: skip delta frames until first keyframe.
-                                                if !seen_keyframe {
-                                                    if frame.is_keyframe {
-                                                        seen_keyframe = true;
-                                                        info!(
-                                                            "Window {} sender: first keyframe ({} bytes), skipped {} deltas",
-                                                            wid,
-                                                            frame.data.len(),
-                                                            delta_skip_count
-                                                        );
-                                                    } else {
-                                                        delta_skip_count += 1;
-                                                        if delta_skip_count <= 3 {
-                                                            info!(
-                                                                "Window {} sender: skipping delta #{} ({} bytes)",
-                                                                wid,
-                                                                delta_skip_count,
-                                                                frame.data.len()
-                                                            );
-                                                        }
-                                                        continue;
-                                                    }
-                                                }
-                                                frame_count += 1;
-                                                if frame_count <= 5 {
-                                                    info!(
-                                                        "Window {} sender frame #{}: {} bytes, keyframe={}",
-                                                        wid,
-                                                        frame_count,
-                                                        frame.data.len(),
-                                                        frame.is_keyframe
-                                                    );
-                                                }
-                                                if let Err(e) = coherence::send_window_video_frame(
-                                                    &session_clone,
-                                                    wid,
-                                                    &frame,
-                                                )
-                                                .await
-                                                {
-                                                    warn!(
-                                                        "Window {} sender: SEND FAILED: {}",
-                                                        wid, e
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                                warn!(
-                                                    "Window {} sender: LAGGED by {}, resetting keyframe gate",
-                                                    wid, n
-                                                );
-                                                seen_keyframe = false;
-                                            }
-                                            Err(broadcast::error::RecvError::Closed) => {
-                                                info!("Window {} sender: channel CLOSED", wid);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    info!(
-                                        "Window {} sender task ENDED (sent {} frames)",
-                                        wid, frame_count
-                                    );
-                                });
-                                cs.track_sender(wid, handle);
+                            Ok(rx) => {
+                                spawn_window_sender(wid, rx, &session, cs);
                             }
                             Err(e) => {
                                 warn!("Failed to subscribe to window {}: {}", wid, e);
@@ -762,11 +688,19 @@ async fn process_input_data_with_coherence(
                     width,
                     height,
                 } => {
-                    let cs_lock = coherence_session.lock().await;
-                    if let Some(ref cs) = *cs_lock
-                        && let Err(e) = cs.resize_window(*window_id, *width, *height)
-                    {
-                        warn!("Failed to resize window {}: {}", window_id, e);
+                    let mut cs_lock = coherence_session.lock().await;
+                    if let Some(ref mut cs) = *cs_lock {
+                        let wid = *window_id;
+                        match cs.resize_window(wid, *width, *height).await {
+                            Ok(Some(rx)) => {
+                                // Pipeline was restarted at new size — spawn new sender
+                                spawn_window_sender(wid, rx, &session, cs);
+                            }
+                            Ok(None) => {} // window wasn't being streamed
+                            Err(e) => {
+                                warn!("Failed to resize window {}: {}", wid, e);
+                            }
+                        }
                     }
                 }
                 InputEvent::FocusWindow { window_id } => {
@@ -864,6 +798,78 @@ fn process_input_data(
 
         offset += event_len;
     }
+}
+
+/// Spawn a sender task that reads frames from a per-window broadcast receiver
+/// and sends them to the client via WebTransport.
+fn spawn_window_sender(
+    wid: u32,
+    mut rx: broadcast::Receiver<EncodedFrame>,
+    session: &Arc<wtransport::Connection>,
+    cs: &mut coherence::CoherenceSession,
+) {
+    let session_clone = session.clone();
+    let handle = tokio::spawn(async move {
+        info!("Window {} sender task STARTED", wid);
+        let mut seen_keyframe = false;
+        let mut frame_count: u64 = 0;
+        let mut delta_skip_count: u64 = 0;
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    if !seen_keyframe {
+                        if frame.is_keyframe {
+                            seen_keyframe = true;
+                            info!(
+                                "Window {} sender: first keyframe ({} bytes), skipped {} deltas",
+                                wid,
+                                frame.data.len(),
+                                delta_skip_count
+                            );
+                        } else {
+                            delta_skip_count += 1;
+                            if delta_skip_count <= 3 {
+                                info!(
+                                    "Window {} sender: skipping delta #{} ({} bytes)",
+                                    wid, delta_skip_count, frame.data.len()
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                    frame_count += 1;
+                    if frame_count <= 5 {
+                        info!(
+                            "Window {} sender frame #{}: {} bytes, keyframe={}",
+                            wid, frame_count, frame.data.len(), frame.is_keyframe
+                        );
+                    }
+                    if let Err(e) =
+                        coherence::send_window_video_frame(&session_clone, wid, &frame).await
+                    {
+                        warn!("Window {} sender: SEND FAILED: {}", wid, e);
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(
+                        "Window {} sender: LAGGED by {}, resetting keyframe gate",
+                        wid, n
+                    );
+                    seen_keyframe = false;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    info!("Window {} sender: channel CLOSED", wid);
+                    break;
+                }
+            }
+        }
+        info!(
+            "Window {} sender task ENDED (sent {} frames)",
+            wid, frame_count
+        );
+    });
+    cs.track_sender(wid, handle);
 }
 
 fn dispatch_event(
