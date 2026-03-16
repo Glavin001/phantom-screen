@@ -780,49 +780,49 @@ async fn process_input_data_with_coherence(
                         let wid = *window_id;
                         let (w, h) = cs.normalize_resize(wid, *width, *height);
 
-                        // Resize the X11 window immediately so it tracks the
-                        // user's mouse. This is a cheap X protocol request.
+                        // CRITICAL ORDER: stop pipeline BEFORE resizing the X11
+                        // window.  The composite pixmap is invalidated the moment
+                        // the window geometry changes.  If ximagesrc is still
+                        // running when we call resize_x11_window(), it will
+                        // access the stale pixmap and flood Xvfb with BadMatch
+                        // errors (~60/sec).  Full stop (NULL state) is required —
+                        // GStreamer's PAUSED state still performs X operations.
+                        cs.stop_window_pipeline(wid);
+
+                        // Now safe to resize the X11 window.
                         if let Err(e) = cs.resize_x11_window(wid, w, h) {
                             warn!("Failed to resize X11 window {}: {}", wid, e);
-                        } else {
-                            // Pause the per-window pipeline immediately so ximagesrc
-                            // stops capturing.  The geometry change invalidates the
-                            // composite pixmap; if ximagesrc keeps running it floods
-                            // Xvfb with BadMatch errors (~60/sec) which can trigger
-                            // a segfault.  The debounced restart below will create a
-                            // fresh pipeline with a valid pixmap.
-                            cs.pause_window_pipeline(wid);
-                            // Debounce the expensive pipeline restart: cancel any
-                            // pending restart for this window and schedule a new
-                            // one after 300ms. During rapid resizing, only the
-                            // last resize triggers a pipeline stop/start cycle.
-                            if let Some(old) = resize_debounce_tasks.remove(&wid) {
-                                old.abort();
-                            }
-                            let cs_for_debounce = coherence_session.clone();
-                            let session_for_debounce = session.clone();
-                            let expected_size = (w, h);
-                            let handle = tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                let mut cs_lock = cs_for_debounce.lock().await;
-                                if let Some(ref mut cs) = *cs_lock {
-                                    match cs.restart_window_pipeline(wid, Some(expected_size)).await
-                                    {
-                                        Ok(Some(rx)) => {
-                                            spawn_window_sender(wid, rx, &session_for_debounce, cs);
-                                        }
-                                        Ok(None) => {}
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to restart pipeline for window {}: {}",
-                                                wid, e
-                                            );
-                                        }
+                        }
+
+                        // Debounce the expensive pipeline restart: cancel any
+                        // pending restart for this window and schedule a new
+                        // one after 300ms. During rapid resizing, only the
+                        // last resize triggers a pipeline stop/start cycle.
+                        if let Some(old) = resize_debounce_tasks.remove(&wid) {
+                            old.abort();
+                        }
+                        let cs_for_debounce = coherence_session.clone();
+                        let session_for_debounce = session.clone();
+                        let expected_size = (w, h);
+                        let handle = tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            let mut cs_lock = cs_for_debounce.lock().await;
+                            if let Some(ref mut cs) = *cs_lock {
+                                match cs.restart_window_pipeline(wid, Some(expected_size)).await {
+                                    Ok(Some(rx)) => {
+                                        spawn_window_sender(wid, rx, &session_for_debounce, cs);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to restart pipeline for window {}: {}",
+                                            wid, e
+                                        );
                                     }
                                 }
-                            });
-                            resize_debounce_tasks.insert(wid, handle);
-                        }
+                            }
+                        });
+                        resize_debounce_tasks.insert(wid, handle);
                     }
                 }
                 InputEvent::FocusWindow { window_id } => {
