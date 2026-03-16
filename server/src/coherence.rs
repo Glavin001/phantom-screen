@@ -131,6 +131,14 @@ impl CoherenceSession {
         self.window_manager.resize(window_id, width, height)
     }
 
+    /// Pause a window's per-window pipeline (e.g., during resize).
+    /// This stops ximagesrc from capturing, preventing BadMatch errors while
+    /// the window geometry is changing.
+    pub fn pause_window_pipeline(&self, window_id: u32) {
+        let mut mgr = self.pipeline_manager.lock().unwrap();
+        mgr.pause_window(window_id);
+    }
+
     /// Restart just the per-window pipeline (debounced path).
     /// Called after a quiet period to avoid restarting on every resize event.
     ///

@@ -771,6 +771,13 @@ async fn process_input_data_with_coherence(
                         if let Err(e) = cs.resize_x11_window(wid, w, h) {
                             warn!("Failed to resize X11 window {}: {}", wid, e);
                         } else {
+                            // Pause the per-window pipeline immediately so ximagesrc
+                            // stops capturing.  The geometry change invalidates the
+                            // composite pixmap; if ximagesrc keeps running it floods
+                            // Xvfb with BadMatch errors (~60/sec) which can trigger
+                            // a segfault.  The debounced restart below will create a
+                            // fresh pipeline with a valid pixmap.
+                            cs.pause_window_pipeline(wid);
                             // Debounce the expensive pipeline restart: cancel any
                             // pending restart for this window and schedule a new
                             // one after 150ms. During rapid resizing, only the
