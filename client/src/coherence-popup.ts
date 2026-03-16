@@ -14,6 +14,7 @@
 import {
   attachInputListeners,
   encodeFocusWindow,
+  encodeResizeWindow,
   encodeUnsubscribeWindow,
   type InputSender,
 } from './input';
@@ -40,8 +41,7 @@ export class WindowPopup {
   private decoderAcceleration: VideoDecoderConfig['hardwareAcceleration'];
   private lastKeyframeRequestTime = 0;
   private unloadHandled = false;
-  /** Only used in popup mode: log once that we are not sending resize to server */
-  private _loggedResizeNotSent = false;
+
 
   constructor(
     info: WindowInfo,
@@ -192,9 +192,8 @@ export class WindowPopup {
     doc.body.appendChild(canvas);
     this.canvas = canvas;
 
-    // Watch for popup resize. Server does not yet support dynamic resolution change,
-    // so we do not send encodeResizeWindow; the stream keeps original size and the
-    // canvas (CSS width/height 100%) stretches to fill the popup.
+    // Watch for popup resize and tell the server to resize the X11 window
+    // so the per-window pipeline captures at the new dimensions.
     this.resizeObserver = new ResizeObserver(() => {
       if (this.resizeTimeout !== null) {
         clearTimeout(this.resizeTimeout);
@@ -204,12 +203,10 @@ export class WindowPopup {
           const w = this.popup.innerWidth;
           const h = this.popup.innerHeight;
           if (w > 0 && h > 0) {
-            if (!this._loggedResizeNotSent) {
-              this._loggedResizeNotSent = true;
-              console.log(
-                `[coherence] wid=${this.windowId} popup resize (${w}x${h}): not sending to server (dynamic resolution not supported); stream will stretch to fit`,
-              );
-            }
+            console.log(
+              `[coherence] wid=${this.windowId} popup resize: sending ${w}x${h} to server`,
+            );
+            this.send(encodeResizeWindow(this.windowId, w, h));
           }
         }
       }, 250);
