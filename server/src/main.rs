@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
             }
         });
 
-        let pipeline_manager = Arc::new(tokio::sync::Mutex::new(
+        let pipeline_manager = Arc::new(std::sync::Mutex::new(
             window_pipeline::WindowPipelineManager::new(&config),
         ));
         let window_manager = Arc::new(
@@ -176,14 +176,11 @@ async fn main() -> Result<()> {
             // Broadcast empty snapshot so clients know all window IDs are invalidated
             let _ = window_events_tx.send(window_monitor::WindowEvent::Snapshot(vec![]));
 
-            if let Ok(mut mgr) = wpm.try_lock() {
-                let count = mgr.active_count();
-                if count > 0 {
-                    tracing::info!("Pre-resize: stopping {} per-window pipeline(s)", count);
-                    mgr.stop_all();
-                }
-            } else {
-                tracing::warn!("Pre-resize: could not lock window pipeline manager");
+            let mut mgr = wpm.lock().unwrap();
+            let count = mgr.active_count();
+            if count > 0 {
+                tracing::info!("Pre-resize: stopping {} per-window pipeline(s)", count);
+                mgr.stop_all();
             }
         }));
     }
@@ -384,16 +381,63 @@ fn install_xlib_error_handler() {
         _display: *mut std::ffi::c_void,
         event: *mut XErrorEvent,
     ) -> i32 {
+        use std::sync::atomic::{AtomicU64, Ordering as AO};
+
+        // Rate-limit logging to prevent error floods (e.g., stale ximagesrc
+        // generating BadMatch every frame at 60fps) from overwhelming the
+        // server and making it unresponsive.
+        static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+        static LAST_LOG_TIME: AtomicU64 = AtomicU64::new(0);
+
         let event = unsafe { &*event };
-        tracing::warn!(
-            error_code = event.error_code,
-            request_code = event.request_code,
-            resource_id = event.resourceid,
-            "X11 error (non-fatal): error={} request={} resource=0x{:x}",
-            event.error_code,
-            event.request_code,
-            event.resourceid,
-        );
+        let count = ERROR_COUNT.fetch_add(1, AO::Relaxed);
+
+        // Log the first 5 errors immediately, then at most once per second
+        let now_ms = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        let last = LAST_LOG_TIME.load(AO::Relaxed);
+        let should_log = count < 5 || (now_ms.saturating_sub(last) >= 1000);
+
+        if should_log {
+            let suppressed = if count >= 5 {
+                let prev = LAST_LOG_TIME.swap(now_ms, AO::Relaxed);
+                if prev == last {
+                    count.saturating_sub(4)
+                } else {
+                    0
+                }
+            } else {
+                LAST_LOG_TIME.store(now_ms, AO::Relaxed);
+                0
+            };
+            if suppressed > 0 {
+                tracing::warn!(
+                    error_code = event.error_code,
+                    request_code = event.request_code,
+                    resource_id = event.resourceid,
+                    "X11 error (non-fatal): error={} request={} resource=0x{:x} ({} errors suppressed)",
+                    event.error_code,
+                    event.request_code,
+                    event.resourceid,
+                    suppressed,
+                );
+            } else {
+                tracing::warn!(
+                    error_code = event.error_code,
+                    request_code = event.request_code,
+                    resource_id = event.resourceid,
+                    "X11 error (non-fatal): error={} request={} resource=0x{:x}",
+                    event.error_code,
+                    event.request_code,
+                    event.resourceid,
+                );
+            }
+        }
         0
     }
 

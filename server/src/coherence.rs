@@ -6,8 +6,9 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -68,7 +69,7 @@ impl CoherenceSession {
         &mut self,
         window_id: u32,
     ) -> Result<broadcast::Receiver<EncodedFrame>> {
-        let mut mgr = self.pipeline_manager.lock().await;
+        let mut mgr = self.pipeline_manager.lock().unwrap();
         let rx = mgr.start_window(window_id)?;
         info!("Session subscribed to window {}", window_id);
         Ok(rx)
@@ -124,10 +125,7 @@ impl CoherenceSession {
         let packed = self.display_size.load(std::sync::atomic::Ordering::Relaxed);
         let display_w = (packed >> 16) as u16;
         let display_h = (packed & 0xFFFF) as u16;
-        if display_w > 0
-            && display_h > 0
-            && (width > display_w || height > display_h)
-        {
+        if display_w > 0 && display_h > 0 && (width > display_w || height > display_h) {
             let clamped_w = width.min(display_w);
             let clamped_h = height.min(display_h);
             info!(
@@ -148,7 +146,7 @@ impl CoherenceSession {
         // Restart the per-window pipeline if it's currently streaming,
         // since ximagesrc negotiates caps once at startup and won't
         // pick up the new window size automatically.
-        let mut mgr = self.pipeline_manager.lock().await;
+        let mut mgr = self.pipeline_manager.lock().unwrap();
         if mgr.is_streaming(window_id) {
             let rx = mgr.restart_window(window_id)?;
             info!(
