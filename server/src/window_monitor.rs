@@ -11,6 +11,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::composite::{self};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 /// Shared snapshot of currently tracked windows, updated by the monitor thread.
 pub type TrackedWindows = Arc<StdMutex<HashMap<u32, WindowInfo>>>;
@@ -739,6 +740,23 @@ impl WindowManager {
         let conn = self.conn.lock().unwrap();
         let atoms = self.atoms.lock().unwrap();
         close_window(&conn, window_id, &atoms)
+    }
+
+    /// Query the actual geometry of a window from the X server.
+    pub fn get_geometry(&self, window_id: u32) -> Result<(u16, u16)> {
+        let conn = self.conn.lock().unwrap();
+        let geom = conn
+            .get_geometry(window_id)?
+            .reply()
+            .context("Failed to get window geometry")?;
+        Ok((geom.width, geom.height))
+    }
+
+    /// Flush all pending requests and wait for the X server to process them.
+    pub fn sync(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.sync().context("X11 sync failed")?;
+        Ok(())
     }
 }
 

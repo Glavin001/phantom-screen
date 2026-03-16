@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::pipeline::{EncodedFrame, clamp_to_display, round_to_even, unpack_display_size};
 use crate::window_monitor::{TrackedWindows, WindowEvent, WindowManager};
@@ -133,14 +133,61 @@ impl CoherenceSession {
 
     /// Restart just the per-window pipeline (debounced path).
     /// Called after a quiet period to avoid restarting on every resize event.
+    ///
+    /// `expected_size` is the (width, height) we asked for.  Before starting
+    /// the new pipeline we poll the X server until the window's actual geometry
+    /// matches (the WM may take a while to process our ConfigureWindow).
     pub async fn restart_window_pipeline(
         &self,
         window_id: u32,
+        expected_size: Option<(u16, u16)>,
     ) -> Result<Option<broadcast::Receiver<EncodedFrame>>> {
-        // Brief delay for the X server to fully process the most recent
-        // ConfigureWindow before ximagesrc starts — without this, ximagesrc
-        // may negotiate caps at a stale geometry and produce 0 frames.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Flush pending X requests so the WM receives our ConfigureWindow.
+        let _ = self.window_manager.sync();
+
+        // Poll until the window geometry matches what we asked for, or give up
+        // after ~1s.  The WM (openbox) processes the resize asynchronously —
+        // if we start ximagesrc before it finishes, the WM's later resize will
+        // invalidate the composite pixmap and ximagesrc enters a permanent
+        // BadMatch loop.
+        if let Some((ew, eh)) = expected_size {
+            for attempt in 0..20 {
+                match self.window_manager.get_geometry(window_id) {
+                    Ok((aw, ah)) if aw == ew && ah == eh => {
+                        if attempt > 0 {
+                            info!(
+                                "Window {} geometry settled to {}x{} after {}ms",
+                                window_id,
+                                aw,
+                                ah,
+                                attempt * 50
+                            );
+                        }
+                        break;
+                    }
+                    Ok((aw, ah)) => {
+                        if attempt == 0 {
+                            debug!(
+                                "Window {} geometry {}x{}, waiting for {}x{}",
+                                window_id, aw, ah, ew, eh
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(_) => {
+                        // Window may have been destroyed; give up.
+                        warn!(
+                            "Window {} geometry query failed, skipping pipeline restart",
+                            window_id
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+        } else {
+            // No expected size — just a brief settle delay.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
 
         let mut mgr = self.pipeline_manager.lock().unwrap();
         if mgr.is_streaming(window_id) {

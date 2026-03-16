@@ -774,11 +774,13 @@ async fn process_input_data_with_coherence(
                             }
                             let cs_for_debounce = coherence_session.clone();
                             let session_for_debounce = session.clone();
+                            let expected_size = (w, h);
                             let handle = tokio::spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                                 let mut cs_lock = cs_for_debounce.lock().await;
                                 if let Some(ref mut cs) = *cs_lock {
-                                    match cs.restart_window_pipeline(wid).await {
+                                    match cs.restart_window_pipeline(wid, Some(expected_size)).await
+                                    {
                                         Ok(Some(rx)) => {
                                             spawn_window_sender(wid, rx, &session_for_debounce, cs);
                                         }
@@ -917,16 +919,23 @@ fn spawn_window_sender(
         loop {
             // Use a timeout to detect pipelines that never produce frames.
             // After 3s: warn. After 5s total: give up — pipeline is dead.
-            let recv_result = if !seen_keyframe {
-                let timeout_secs = if warned_no_frames { 2 } else { 3 };
-                match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx.recv())
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
+            // Always use a timeout — even after keyframe.  If the window is
+            // resized by the WM after the pipeline started, ximagesrc's
+            // composite pixmap is invalidated and it stops producing frames
+            // permanently.  Without a timeout here the sender would block
+            // forever on rx.recv().
+            let timeout_dur = if !seen_keyframe {
+                std::time::Duration::from_secs(if warned_no_frames { 2 } else { 3 })
+            } else {
+                // Generous keepalive: if no frame arrives for 3s while
+                // we were previously receiving frames, the pipeline is dead.
+                std::time::Duration::from_secs(3)
+            };
+            let recv_result = match tokio::time::timeout(timeout_dur, rx.recv()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if !seen_keyframe {
                         if warned_no_frames {
-                            // Second timeout (5s total). Pipeline is dead — exit
-                            // cleanly. A new resize or subscribe will restart it.
                             warn!(
                                 "Window {} sender: no frames after {:.1}s, giving up \
                                  (pipeline will restart on next resize)",
@@ -943,10 +952,19 @@ fn spawn_window_sender(
                             start_time.elapsed().as_secs_f64()
                         );
                         continue;
+                    } else {
+                        // Post-keyframe stall: pipeline died (likely composite
+                        // pixmap invalidation from a WM resize).
+                        warn!(
+                            "Window {} sender: pipeline stalled after {} frames \
+                             ({:.1}s elapsed), exiting",
+                            wid,
+                            frame_count,
+                            start_time.elapsed().as_secs_f64()
+                        );
+                        break;
                     }
                 }
-            } else {
-                rx.recv().await
             };
             match recv_result {
                 Ok(frame) => {
