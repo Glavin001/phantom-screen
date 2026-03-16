@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::broadcast;
 use x11rb::connection::Connection;
-use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
+use x11rb::protocol::composite::{self};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
 
@@ -443,8 +443,6 @@ fn run_monitor_session(
             *shared = tracked.clone();
         }
     }
-
-    Ok(())
 }
 
 /// Enumerate existing windows at startup.

@@ -235,7 +235,6 @@ impl WindowPipelineManager {
 /// This uses the Rust x11rb library (not Xlib), which handles X errors
 /// gracefully via Result types instead of calling exit().
 fn validate_window_exists(x_display: &str, window_id: u32) -> bool {
-    use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt;
 
     let conn = match x11rb::rust_connection::RustConnection::connect(Some(x_display)) {

@@ -663,7 +663,7 @@ async fn process_input_data_with_coherence(
                             let wid = *window_id;
                             match cs.subscribe_window(wid).await {
                                 Ok(rx) => {
-                                    spawn_window_sender(wid, rx, &session, cs);
+                                    spawn_window_sender(wid, rx, session, cs);
                                 }
                                 Err(e) => {
                                     warn!("Failed to subscribe to window {}: {}", wid, e);
@@ -689,7 +689,7 @@ async fn process_input_data_with_coherence(
                         match cs.resize_window(wid, *width, *height).await {
                             Ok(Some(rx)) => {
                                 // Pipeline was restarted at new size — spawn new sender
-                                spawn_window_sender(wid, rx, &session, cs);
+                                spawn_window_sender(wid, rx, session, cs);
                             }
                             Ok(None) => {} // window wasn't being streamed
                             Err(e) => {

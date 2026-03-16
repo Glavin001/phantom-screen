@@ -30,7 +30,7 @@ pub fn query_display_resolution(display: &str) -> Result<(u16, u16)> {
             // e.g. "dimensions:    1920x1080 pixels"
             if let Some(dim_str) = trimmed
                 .strip_prefix("dimensions:")
-                .and_then(|s| s.trim().split_whitespace().next())
+                .and_then(|s| s.split_whitespace().next())
             {
                 let mut parts = dim_str.split('x');
                 if let (Some(w), Some(h)) = (parts.next(), parts.next()) {
@@ -206,10 +206,10 @@ impl PipelineManager {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Reconnect the input handler to the new X display
-        if let Some(ref ih) = self.input_handler {
-            if let Err(e) = ih.reconnect() {
-                tracing::error!("Failed to reconnect input handler after resize: {}", e);
-            }
+        if let Some(ref ih) = self.input_handler
+            && let Err(e) = ih.reconnect()
+        {
+            tracing::error!("Failed to reconnect input handler after resize: {}", e);
         }
 
         // Restart the post-start command (e.g. xterm) since it lost its X connection
@@ -372,13 +372,12 @@ pub fn resize_display(display: &str, width: u16, height: u16) -> Result<()> {
     if let Ok(output) = pgrep {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
-            if line.contains(display) {
-                if let Some(pid_str) = line.split_whitespace().next() {
-                    if let Ok(pid) = pid_str.parse::<i32>() {
-                        tracing::info!("Killing existing Xvfb (pid {}) for resize", pid);
-                        let _ = Command::new("kill").args(["-TERM", pid_str]).output();
-                    }
-                }
+            if line.contains(display)
+                && let Some(pid_str) = line.split_whitespace().next()
+                && let Ok(pid) = pid_str.parse::<i32>()
+            {
+                tracing::info!("Killing existing Xvfb (pid {}) for resize", pid);
+                let _ = Command::new("kill").args(["-TERM", pid_str]).output();
             }
         }
     }
