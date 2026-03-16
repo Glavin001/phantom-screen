@@ -150,6 +150,11 @@ impl PipelineManager {
     /// 3. Starts a new main pipeline.
     /// 4. Publishes the new broadcast sender so sessions re-subscribe.
     pub fn resize(&self, width: u16, height: u16) -> Result<()> {
+        // Round up to even dimensions — x264enc/I420 require even width and height
+        // for 4:2:0 chroma subsampling.
+        let width = (width + 1) & !1;
+        let height = (height + 1) & !1;
+
         let mut config = self.config.lock().unwrap();
         let current_w = config.resolution_width() as u16;
         let current_h = config.resolution_height() as u16;
@@ -248,6 +253,10 @@ impl PipelineManager {
     /// Use this when the display resolution changed externally (e.g. xrandr)
     /// and the pipeline needs to re-capture at the new size.
     pub fn restart_pipeline(&self, new_width: u16, new_height: u16) -> Result<()> {
+        // Round up to even dimensions — x264enc/I420 require even width and height
+        let new_width = (new_width + 1) & !1;
+        let new_height = (new_height + 1) & !1;
+
         let mut config = self.config.lock().unwrap();
 
         tracing::info!(
