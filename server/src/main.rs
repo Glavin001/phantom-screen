@@ -9,6 +9,7 @@ mod pipeline;
 mod window_monitor;
 mod window_pipeline;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -594,6 +595,8 @@ async fn handle_session(
                 let session_for_input = session.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
+                    let mut resize_debounce_tasks: HashMap<u32, tokio::task::JoinHandle<()>> =
+                        HashMap::new();
                     loop {
                         match recv.read(&mut buf).await {
                             Ok(Some(n)) if n > 0 => {
@@ -604,6 +607,7 @@ async fn handle_session(
                                     &cs,
                                     &cs_session,
                                     &session_for_input,
+                                    &mut resize_debounce_tasks,
                                 )
                                 .await;
                             }
@@ -613,6 +617,10 @@ async fn handle_session(
                                 break;
                             }
                         }
+                    }
+                    // Cancel pending resize debounce tasks
+                    for (_, task) in resize_debounce_tasks.drain() {
+                        task.abort();
                     }
                     // Close our side
                     let _ = send.finish().await;
@@ -658,6 +666,7 @@ async fn process_input_data_with_coherence(
     coherence_state: &Arc<coherence::CoherenceState>,
     coherence_session: &Arc<tokio::sync::Mutex<Option<coherence::CoherenceSession>>>,
     session: &Arc<wtransport::Connection>,
+    resize_debounce_tasks: &mut HashMap<u32, tokio::task::JoinHandle<()>>,
 ) {
     let mut offset = 0;
     while offset < data.len() {
@@ -747,17 +756,43 @@ async fn process_input_data_with_coherence(
                             "Window {} resize rejected: Composite not ready (display resizing)",
                             window_id
                         );
-                    } else if let Some(ref mut cs) = *coherence_session.lock().await {
+                    } else if let Some(ref cs) = *coherence_session.lock().await {
                         let wid = *window_id;
-                        match cs.resize_window(wid, *width, *height).await {
-                            Ok(Some(rx)) => {
-                                // Pipeline was restarted at new size — spawn new sender
-                                spawn_window_sender(wid, rx, session, cs);
+                        let (w, h) = cs.normalize_resize(wid, *width, *height);
+
+                        // Resize the X11 window immediately so it tracks the
+                        // user's mouse. This is a cheap X protocol request.
+                        if let Err(e) = cs.resize_x11_window(wid, w, h) {
+                            warn!("Failed to resize X11 window {}: {}", wid, e);
+                        } else {
+                            // Debounce the expensive pipeline restart: cancel any
+                            // pending restart for this window and schedule a new
+                            // one after 150ms. During rapid resizing, only the
+                            // last resize triggers a pipeline stop/start cycle.
+                            if let Some(old) = resize_debounce_tasks.remove(&wid) {
+                                old.abort();
                             }
-                            Ok(None) => {} // window wasn't being streamed
-                            Err(e) => {
-                                warn!("Failed to resize window {}: {}", wid, e);
-                            }
+                            let cs_for_debounce = coherence_session.clone();
+                            let session_for_debounce = session.clone();
+                            let handle = tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                let mut cs_lock = cs_for_debounce.lock().await;
+                                if let Some(ref mut cs) = *cs_lock {
+                                    match cs.restart_window_pipeline(wid).await {
+                                        Ok(Some(rx)) => {
+                                            spawn_window_sender(wid, rx, &session_for_debounce, cs);
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to restart pipeline for window {}: {}",
+                                                wid, e
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                            resize_debounce_tasks.insert(wid, handle);
                         }
                     }
                 }
@@ -880,20 +915,33 @@ fn spawn_window_sender(
         let start_time = tokio::time::Instant::now();
         let mut warned_no_frames = false;
         loop {
-            // Use a timeout to detect pipelines that never produce frames
-            // (e.g., due to odd dimensions causing silent cap negotiation failure)
-            let recv_result = if !seen_keyframe && !warned_no_frames {
-                match tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await {
+            // Use a timeout to detect pipelines that never produce frames.
+            // After 3s: warn. After 5s total: give up — pipeline is dead.
+            let recv_result = if !seen_keyframe {
+                let timeout_secs = if warned_no_frames { 2 } else { 3 };
+                match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx.recv())
+                    .await
+                {
                     Ok(result) => result,
                     Err(_) => {
+                        if warned_no_frames {
+                            // Second timeout (5s total). Pipeline is dead — exit
+                            // cleanly. A new resize or subscribe will restart it.
+                            warn!(
+                                "Window {} sender: no frames after {:.1}s, giving up \
+                                 (pipeline will restart on next resize)",
+                                wid,
+                                start_time.elapsed().as_secs_f64()
+                            );
+                            break;
+                        }
                         warned_no_frames = true;
                         warn!(
-                            "Window {} sender: no frames received after {:.1}s — pipeline may have failed \
-                             (check GStreamer errors above, common cause: odd dimensions)",
+                            "Window {} sender: no frames received after {:.1}s — \
+                             pipeline may have failed, will retry for 2 more seconds",
                             wid,
                             start_time.elapsed().as_secs_f64()
                         );
-                        // Continue waiting (don't break — pipeline might eventually produce)
                         continue;
                     }
                 }

@@ -105,23 +105,12 @@ impl CoherenceSession {
         }
     }
 
-    /// Resize a remote X11 window and restart its per-window pipeline
-    /// so ximagesrc captures at the new dimensions.
-    pub async fn resize_window(
-        &self,
-        window_id: u32,
-        width: u16,
-        height: u16,
-    ) -> Result<Option<broadcast::Receiver<EncodedFrame>>> {
-        // Round up to even dimensions — x264enc / I420 (4:2:0 chroma subsampling)
-        // requires even width and height; odd values cause silent cap negotiation
-        // failure resulting in 0 fps (black screen).
+    /// Normalize dimensions for a coherence window resize: round to even,
+    /// clamp to display bounds.
+    pub fn normalize_resize(&self, window_id: u32, width: u16, height: u16) -> (u16, u16) {
         let mut width = round_to_even(width);
         let mut height = round_to_even(height);
 
-        // Clamp to the current display dimensions — a window exceeding the Xvfb
-        // display bounds causes Composite BadMatch errors every frame, resulting
-        // in black/corrupt captures.
         let packed = self.display_size.load(std::sync::atomic::Ordering::Acquire);
         let (display_w, display_h) = unpack_display_size(packed);
         let (clamped_w, clamped_h) = clamp_to_display(width, height, display_w, display_h);
@@ -133,30 +122,32 @@ impl CoherenceSession {
             width = clamped_w;
             height = clamped_h;
         }
+        (width, height)
+    }
 
-        info!(
-            "Resizing coherence window {} to {}x{}",
-            window_id, width, height
-        );
+    /// Resize the X11 window immediately (fast, just an X protocol request).
+    /// Call this for every resize event so the window tracks the user's mouse.
+    pub fn resize_x11_window(&self, window_id: u32, width: u16, height: u16) -> Result<()> {
+        self.window_manager.resize(window_id, width, height)
+    }
 
-        self.window_manager.resize(window_id, width, height)?;
+    /// Restart just the per-window pipeline (debounced path).
+    /// Called after a quiet period to avoid restarting on every resize event.
+    pub async fn restart_window_pipeline(
+        &self,
+        window_id: u32,
+    ) -> Result<Option<broadcast::Receiver<EncodedFrame>>> {
+        // Brief delay for the X server to fully process the most recent
+        // ConfigureWindow before ximagesrc starts — without this, ximagesrc
+        // may negotiate caps at a stale geometry and produce 0 frames.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Restart the per-window pipeline if it's currently streaming,
-        // since ximagesrc negotiates caps once at startup and won't
-        // pick up the new window size automatically.
         let mut mgr = self.pipeline_manager.lock().unwrap();
         if mgr.is_streaming(window_id) {
             let rx = mgr.restart_window(window_id)?;
-            info!(
-                "Restarted per-window pipeline for window {} at {}x{}",
-                window_id, width, height
-            );
+            info!("Restarted per-window pipeline for window {}", window_id);
             Ok(Some(rx))
         } else {
-            info!(
-                "Window {} not currently streaming, skipping pipeline restart",
-                window_id
-            );
             Ok(None)
         }
     }
