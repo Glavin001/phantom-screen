@@ -106,6 +106,17 @@ impl CoherenceSession {
         width: u16,
         height: u16,
     ) -> Result<Option<broadcast::Receiver<EncodedFrame>>> {
+        // Round up to even dimensions — x264enc / I420 (4:2:0 chroma subsampling)
+        // requires even width and height; odd values cause silent cap negotiation
+        // failure resulting in 0 fps (black screen).
+        let width = (width + 1) & !1;
+        let height = (height + 1) & !1;
+
+        info!(
+            "Resizing coherence window {} to {}x{} (rounded to even)",
+            window_id, width, height
+        );
+
         self.window_manager.resize(window_id, width, height)?;
 
         // Restart the per-window pipeline if it's currently streaming,
@@ -120,6 +131,10 @@ impl CoherenceSession {
             );
             Ok(Some(rx))
         } else {
+            info!(
+                "Window {} not currently streaming, skipping pipeline restart",
+                window_id
+            );
             Ok(None)
         }
     }

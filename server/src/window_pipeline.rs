@@ -18,6 +18,7 @@ struct WindowPipeline {
     pipeline: gstreamer::Pipeline,
     tx: broadcast::Sender<EncodedFrame>,
     running: AtomicBool,
+    _bus_watch: Option<gstreamer::bus::BusWatchGuard>,
 }
 
 impl WindowPipeline {
@@ -162,6 +163,35 @@ impl WindowPipelineManager {
                 .build(),
         );
 
+        // Watch for GStreamer bus errors/warnings to diagnose pipeline failures
+        // (e.g., ximagesrc cap negotiation failure with odd dimensions).
+        let bus = pipeline.bus().context("No bus on pipeline")?;
+        let wid_for_bus = window_id;
+        let bus_watch = bus.add_watch(move |_, msg| {
+            use gstreamer::MessageView;
+            match msg.view() {
+                MessageView::Error(err) => {
+                    tracing::error!(
+                        "Window {} pipeline GStreamer ERROR: {} (debug: {:?})",
+                        wid_for_bus,
+                        err.error(),
+                        err.debug()
+                    );
+                }
+                MessageView::Warning(w) => {
+                    tracing::warn!(
+                        "Window {} pipeline GStreamer WARNING: {} (debug: {:?})",
+                        wid_for_bus,
+                        w.error(),
+                        w.debug()
+                    );
+                }
+                _ => {}
+            }
+            gstreamer::glib::ControlFlow::Continue
+        })
+        .context("Failed to add bus watch")?;
+
         pipeline
             .set_state(gstreamer::State::Playing)
             .context("Failed to start per-window pipeline")?;
@@ -170,6 +200,7 @@ impl WindowPipelineManager {
             pipeline,
             tx,
             running: AtomicBool::new(true),
+            _bus_watch: Some(bus_watch),
         };
 
         self.pipelines.insert(window_id, wp);

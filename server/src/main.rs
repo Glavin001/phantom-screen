@@ -809,8 +809,30 @@ fn spawn_window_sender(
         let mut seen_keyframe = false;
         let mut frame_count: u64 = 0;
         let mut delta_skip_count: u64 = 0;
+        let start_time = tokio::time::Instant::now();
+        let mut warned_no_frames = false;
         loop {
-            match rx.recv().await {
+            // Use a timeout to detect pipelines that never produce frames
+            // (e.g., due to odd dimensions causing silent cap negotiation failure)
+            let recv_result = if !seen_keyframe && !warned_no_frames {
+                match tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warned_no_frames = true;
+                        warn!(
+                            "Window {} sender: no frames received after {:.1}s — pipeline may have failed \
+                             (check GStreamer errors above, common cause: odd dimensions)",
+                            wid,
+                            start_time.elapsed().as_secs_f64()
+                        );
+                        // Continue waiting (don't break — pipeline might eventually produce)
+                        continue;
+                    }
+                }
+            } else {
+                rx.recv().await
+            };
+            match recv_result {
                 Ok(frame) => {
                     if !seen_keyframe {
                         if frame.is_keyframe {

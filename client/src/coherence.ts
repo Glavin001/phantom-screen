@@ -156,9 +156,14 @@ export class CoherenceController {
     if (popup) {
       popup.decodeFrame(data, isKeyframe, pts);
     } else {
-      console.warn(`[coherence] no popup for wid=${windowId}, dropping frame`);
+      // Only warn once per window to avoid log spam
+      if (!this._droppedFrameWarned.has(windowId)) {
+        console.warn(`[coherence] no popup for wid=${windowId}, dropping frame (further drops silent)`);
+        this._droppedFrameWarned.add(windowId);
+      }
     }
   }
+  private _droppedFrameWarned = new Set<number>();
 
   /**
    * Handle a window event message from the server (0x40 prefix).

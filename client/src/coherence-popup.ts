@@ -203,10 +203,14 @@ export class WindowPopup {
           const w = this.popup.innerWidth;
           const h = this.popup.innerHeight;
           if (w > 0 && h > 0) {
+            const evenW = w % 2 === 0 ? w : w + 1;
+            const evenH = h % 2 === 0 ? h : h + 1;
             console.log(
-              `[coherence] wid=${this.windowId} popup resize: sending ${w}x${h} to server`,
+              `[coherence] wid=${this.windowId} popup resize: raw=${w}x${h}, sending=${evenW}x${evenH} to server`,
             );
-            this.send(encodeResizeWindow(this.windowId, w, h));
+            this.send(encodeResizeWindow(this.windowId, evenW, evenH));
+            // Mark that we're waiting for the pipeline restart's keyframe
+            this.waitingForKeyframe = true;
           }
         }
       }, 250);
@@ -351,7 +355,12 @@ export class WindowPopup {
       return;
     }
 
-    if (!this.decoder) return;
+    if (!this.decoder) {
+      if (this.frameCount === 0) {
+        console.warn(`[coherence] wid=${this.windowId} frame received but no decoder`);
+      }
+      return;
+    }
 
     // Auto-recover from closed decoder
     if (this.decoder.state === 'closed') {
@@ -362,9 +371,15 @@ export class WindowPopup {
 
     // Keyframe gating: drop delta frames until we receive a keyframe
     if (this.waitingForKeyframe) {
-      if (!isKeyframe) return;
+      if (!isKeyframe) {
+        if (this.frameCount % 60 === 0) {
+          console.debug(`[coherence] wid=${this.windowId} waiting for keyframe, dropped ${this.frameCount} delta frames`);
+        }
+        this.frameCount++;
+        return;
+      }
       this.waitingForKeyframe = false;
-      console.log(`[coherence] wid=${this.windowId} received keyframe (${data.length}B), starting decode`);
+      console.log(`[coherence] wid=${this.windowId} received keyframe (${data.length}B) after ${this.frameCount} dropped deltas, starting decode`);
     }
 
     this.frameCount++;
@@ -505,11 +520,15 @@ function getPopupDecoderScript(): string {
       return;
     }
     if (d.type === 'phantom-coherence-frame') {
-      if (!decoder || decoder.state === 'closed') return;
+      if (!decoder || decoder.state === 'closed') {
+        console.debug('[popup] frame received but decoder not ready, state=' + (decoder ? decoder.state : 'null'));
+        return;
+      }
       if (waitingForKeyframe && !d.isKeyframe) return;
       if (d.isKeyframe) {
         waitingForKeyframe = false;
         if (firstPts === null) firstPts = d.pts;
+        console.log('[popup] keyframe received: ' + new Uint8Array(d.data).length + 'B');
       }
       if (!d.data) return;
       if (decoder.decodeQueueSize > 8) return;
