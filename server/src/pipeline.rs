@@ -287,6 +287,90 @@ impl PipelineManager {
         Ok(())
     }
 
+    /// Recover from an Xvfb crash by restarting it at the current resolution.
+    ///
+    /// This performs the same steps as `resize` but forces a restart even though
+    /// the resolution hasn't changed. Used by the Xvfb watchdog when it detects
+    /// that the X server has died unexpectedly.
+    pub fn recover(&self) -> Result<()> {
+        let config = self.config.lock().unwrap();
+        let width = config.resolution_width() as u16;
+        let height = config.resolution_height() as u16;
+        let disp = config.display.clone();
+        drop(config);
+
+        tracing::warn!(
+            "Xvfb crash recovery: restarting at {}x{} on {}",
+            width,
+            height,
+            disp,
+        );
+
+        // Stop old pipeline (may already be dead, but ensure cleanup)
+        {
+            let controller = self.controller.lock().unwrap();
+            controller.stop();
+        }
+
+        // Run pre-resize hooks (stop per-window pipelines, mark composite not ready)
+        {
+            let hooks = self.pre_resize_hooks.lock().unwrap();
+            for hook in hooks.iter() {
+                hook();
+            }
+        }
+
+        // Brief pause to let GStreamer elements fully release X connections
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Restart Xvfb at the same resolution
+        resize_display(&disp, width, height)?;
+
+        // Brief pause for X server to settle
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Reconnect the input handler
+        if let Some(ref ih) = self.input_handler
+            && let Err(e) = ih.reconnect()
+        {
+            tracing::error!("Recovery: failed to reconnect input handler: {}", e);
+        }
+
+        // Restart the post-start command
+        if let Some(ref cmd) = self.post_start_command {
+            tracing::info!("Recovery: restarting post-start command: {}", cmd);
+            let _ = std::process::Command::new("sh")
+                .args(["-c", cmd])
+                .env("DISPLAY", &disp)
+                .spawn()
+                .map_err(|e| tracing::error!("Failed to restart post-start command: {}", e));
+        }
+
+        // Start new pipeline
+        let (new_tx, new_controller) = {
+            let config = self.config.lock().unwrap();
+            start_pipeline_inner(&config, self.encoder_type)?
+        };
+
+        {
+            let mut controller = self.controller.lock().unwrap();
+            *controller = new_controller;
+        }
+
+        let _ = self.frame_watch_tx.send(new_tx);
+        tracing::info!("Xvfb crash recovery complete, pipeline restarted at {}x{}", width, height);
+
+        // Run post-resize hooks (reconnect WindowManager, etc.)
+        {
+            let hooks = self.post_resize_hooks.lock().unwrap();
+            for hook in hooks.iter() {
+                hook();
+            }
+        }
+
+        Ok(())
+    }
+
     /// Restart the pipeline without changing the display.
     ///
     /// Use this when the display resolution changed externally (e.g. xrandr)
@@ -557,6 +641,76 @@ pub fn spawn_resolution_monitor(
                 }
                 Err(e) => {
                     tracing::debug!("Resolution monitor: could not query display: {}", e);
+                }
+            }
+        }
+    })
+}
+
+/// Spawn a background task that monitors whether Xvfb is alive and recovers from crashes.
+///
+/// Polls `xdpyinfo` at regular intervals. After `failure_threshold` consecutive failures,
+/// assumes Xvfb has crashed and triggers a full recovery (restart Xvfb, pipeline, WM, etc.).
+/// Resets the failure counter on any successful query.
+pub fn spawn_xvfb_watchdog(
+    pipeline_manager: Arc<PipelineManager>,
+    disp: String,
+    poll_interval: std::time::Duration,
+    failure_threshold: u32,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(poll_interval);
+        // Skip the first immediate tick
+        interval.tick().await;
+
+        let mut consecutive_failures: u32 = 0;
+
+        loop {
+            interval.tick().await;
+
+            match query_display_resolution(&disp) {
+                Ok(_) => {
+                    if consecutive_failures > 0 {
+                        tracing::debug!(
+                            "Xvfb watchdog: display recovered (was {} failures)",
+                            consecutive_failures
+                        );
+                    }
+                    consecutive_failures = 0;
+                }
+                Err(_) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= failure_threshold {
+                        tracing::error!(
+                            "Xvfb watchdog: {} consecutive failures on {}, starting recovery",
+                            consecutive_failures,
+                            disp,
+                        );
+                        consecutive_failures = 0;
+
+                        // Run recovery on a blocking thread since it uses std::thread::sleep.
+                        // The await here naturally blocks the watchdog loop during recovery.
+                        let pm = pipeline_manager.clone();
+                        let result = tokio::task::spawn_blocking(move || pm.recover()).await;
+
+                        match result {
+                            Ok(Ok(())) => {
+                                tracing::info!("Xvfb watchdog: recovery successful");
+                            }
+                            Ok(Err(e)) => {
+                                tracing::error!("Xvfb watchdog: recovery failed: {}", e);
+                            }
+                            Err(e) => {
+                                tracing::error!("Xvfb watchdog: recovery task panicked: {}", e);
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            "Xvfb watchdog: display query failed ({}/{})",
+                            consecutive_failures,
+                            failure_threshold
+                        );
+                    }
                 }
             }
         }

@@ -91,6 +91,12 @@ async fn main() -> Result<()> {
     let display_for_monitor = config.display.clone();
     pipeline::spawn_resolution_monitor(pm_for_monitor, display_for_monitor, Duration::from_secs(2));
 
+    // Watchdog: detect Xvfb crashes and auto-recover by restarting at current resolution.
+    // Polls every 3s, triggers recovery after 3 consecutive failures (~9s of downtime).
+    let pm_for_watchdog = pipeline_manager.clone();
+    let display_for_watchdog = config.display.clone();
+    pipeline::spawn_xvfb_watchdog(pm_for_watchdog, display_for_watchdog, Duration::from_secs(3), 3);
+
     // Initialize coherence mode support (window monitor + pipeline manager)
     let coherence_state = {
         let (window_rx, tracked_windows, _monitor_handle) =
