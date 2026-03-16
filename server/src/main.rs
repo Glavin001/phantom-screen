@@ -95,7 +95,12 @@ async fn main() -> Result<()> {
     // Polls every 3s, triggers recovery after 3 consecutive failures (~9s of downtime).
     let pm_for_watchdog = pipeline_manager.clone();
     let display_for_watchdog = config.display.clone();
-    pipeline::spawn_xvfb_watchdog(pm_for_watchdog, display_for_watchdog, Duration::from_secs(3), 3);
+    pipeline::spawn_xvfb_watchdog(
+        pm_for_watchdog,
+        display_for_watchdog,
+        Duration::from_secs(3),
+        3,
+    );
 
     // Initialize coherence mode support (window monitor + pipeline manager)
     let coherence_state = {
@@ -691,6 +696,11 @@ async fn process_input_data_with_coherence(
                         *cs_lock = Some(cs);
                         info!("Coherence mode enabled for session");
 
+                        // Pause the main desktop capture pipeline — per-window
+                        // pipelines take over, so the full-screen ximagesrc just
+                        // wastes X server resources and can destabilize Xvfb.
+                        pipeline_manager.pause();
+
                         // Send a fresh snapshot of current windows immediately
                         let snapshot = coherence_state.current_snapshot();
                         let snapshot_data = coherence::serialize_window_event(&snapshot);
@@ -717,6 +727,10 @@ async fn process_input_data_with_coherence(
                     if let Some(mut cs) = cs_lock.take() {
                         cs.cleanup();
                         info!("Coherence mode disabled for session");
+
+                        // Resume the main desktop capture pipeline now that
+                        // per-window pipelines are torn down.
+                        pipeline_manager.resume();
                     }
                 }
                 InputEvent::SubscribeWindow { window_id } => {
@@ -780,7 +794,7 @@ async fn process_input_data_with_coherence(
                             cs.pause_window_pipeline(wid);
                             // Debounce the expensive pipeline restart: cancel any
                             // pending restart for this window and schedule a new
-                            // one after 150ms. During rapid resizing, only the
+                            // one after 300ms. During rapid resizing, only the
                             // last resize triggers a pipeline stop/start cycle.
                             if let Some(old) = resize_debounce_tasks.remove(&wid) {
                                 old.abort();
@@ -789,7 +803,7 @@ async fn process_input_data_with_coherence(
                             let session_for_debounce = session.clone();
                             let expected_size = (w, h);
                             let handle = tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                 let mut cs_lock = cs_for_debounce.lock().await;
                                 if let Some(ref mut cs) = *cs_lock {
                                     match cs.restart_window_pipeline(wid, Some(expected_size)).await

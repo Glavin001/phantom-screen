@@ -50,6 +50,10 @@ pub struct CoherenceSession {
     window_manager: Arc<WindowManager>,
     subscriptions: HashMap<u32, JoinHandle<()>>,
     display_size: Arc<AtomicU32>,
+    /// Tracks when each window's pipeline was last restarted.
+    /// Used to enforce a minimum cooldown between restarts to avoid
+    /// overwhelming the X server with rapid pipeline create/destroy cycles.
+    last_restart: HashMap<u32, std::time::Instant>,
 }
 
 impl CoherenceSession {
@@ -60,6 +64,7 @@ impl CoherenceSession {
             window_manager: state.window_manager.clone(),
             subscriptions: HashMap::new(),
             display_size: state.display_size.clone(),
+            last_restart: HashMap::new(),
         }
     }
 
@@ -145,11 +150,28 @@ impl CoherenceSession {
     /// `expected_size` is the (width, height) we asked for.  Before starting
     /// the new pipeline we poll the X server until the window's actual geometry
     /// matches (the WM may take a while to process our ConfigureWindow).
+    ///
+    /// Enforces a minimum 500ms cooldown between restarts for the same window
+    /// to prevent overwhelming Xvfb with rapid pipeline create/destroy cycles.
     pub async fn restart_window_pipeline(
-        &self,
+        &mut self,
         window_id: u32,
         expected_size: Option<(u16, u16)>,
     ) -> Result<Option<broadcast::Receiver<EncodedFrame>>> {
+        // Enforce minimum cooldown between pipeline restarts for the same window.
+        const MIN_RESTART_INTERVAL_MS: u64 = 500;
+        if let Some(last) = self.last_restart.get(&window_id) {
+            let elapsed = last.elapsed();
+            if elapsed < std::time::Duration::from_millis(MIN_RESTART_INTERVAL_MS) {
+                let remaining = std::time::Duration::from_millis(MIN_RESTART_INTERVAL_MS) - elapsed;
+                debug!(
+                    "Window {} pipeline restart cooldown: waiting {}ms",
+                    window_id,
+                    remaining.as_millis()
+                );
+                tokio::time::sleep(remaining).await;
+            }
+        }
         // Flush pending X requests so the WM receives our ConfigureWindow.
         let _ = self.window_manager.sync();
 
@@ -200,6 +222,9 @@ impl CoherenceSession {
         let mut mgr = self.pipeline_manager.lock().unwrap();
         if mgr.is_streaming(window_id) {
             let rx = mgr.restart_window(window_id)?;
+            drop(mgr);
+            self.last_restart
+                .insert(window_id, std::time::Instant::now());
             info!("Restarted per-window pipeline for window {}", window_id);
             Ok(Some(rx))
         } else {

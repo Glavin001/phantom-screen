@@ -304,7 +304,7 @@ fn redirect_window_composite(
     // Send the redirect request and check the result, ensuring the borrow
     // of `conn` is released before we try to move it.
     let result = composite::redirect_window(&conn, window_id, composite::Redirect::AUTOMATIC)
-        .and_then(|cookie| Ok(cookie.check()));
+        .map(|cookie| cookie.check());
     match result {
         Ok(Ok(())) => {
             tracing::debug!("Composite redirect_window({}) OK", window_id);

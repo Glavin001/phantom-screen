@@ -134,6 +134,19 @@ impl PipelineController {
         let _ = self.pipeline.state(gstreamer::ClockTime::from_seconds(5));
         tracing::info!("Pipeline stopped");
     }
+
+    /// Pause the pipeline (e.g., during coherence mode when per-window pipelines
+    /// take over capture).  This stops ximagesrc from consuming X server resources.
+    pub fn pause(&self) {
+        let _ = self.pipeline.set_state(gstreamer::State::Paused);
+        tracing::info!("Main pipeline paused");
+    }
+
+    /// Resume the pipeline after pausing.
+    pub fn resume(&self) {
+        let _ = self.pipeline.set_state(gstreamer::State::Playing);
+        tracing::info!("Main pipeline resumed");
+    }
 }
 
 /// Manages pipeline lifecycle including dynamic restarts for resolution changes.
@@ -358,7 +371,11 @@ impl PipelineManager {
         }
 
         let _ = self.frame_watch_tx.send(new_tx);
-        tracing::info!("Xvfb crash recovery complete, pipeline restarted at {}x{}", width, height);
+        tracing::info!(
+            "Xvfb crash recovery complete, pipeline restarted at {}x{}",
+            width,
+            height
+        );
 
         // Run post-resize hooks (reconnect WindowManager, etc.)
         {
@@ -431,6 +448,17 @@ impl PipelineManager {
 
     pub fn stop(&self) {
         self.controller.lock().unwrap().stop();
+    }
+
+    /// Pause the main desktop capture pipeline to reduce X server load.
+    /// Used when coherence mode is active and per-window pipelines handle capture.
+    pub fn pause(&self) {
+        self.controller.lock().unwrap().pause();
+    }
+
+    /// Resume the main desktop capture pipeline.
+    pub fn resume(&self) {
+        self.controller.lock().unwrap().resume();
     }
 
     pub fn force_keyframe(&self) {
