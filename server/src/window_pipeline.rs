@@ -167,30 +167,31 @@ impl WindowPipelineManager {
         // (e.g., ximagesrc cap negotiation failure with odd dimensions).
         let bus = pipeline.bus().context("No bus on pipeline")?;
         let wid_for_bus = window_id;
-        let bus_watch = bus.add_watch(move |_, msg| {
-            use gstreamer::MessageView;
-            match msg.view() {
-                MessageView::Error(err) => {
-                    tracing::error!(
-                        "Window {} pipeline GStreamer ERROR: {} (debug: {:?})",
-                        wid_for_bus,
-                        err.error(),
-                        err.debug()
-                    );
+        let bus_watch = bus
+            .add_watch(move |_, msg| {
+                use gstreamer::MessageView;
+                match msg.view() {
+                    MessageView::Error(err) => {
+                        tracing::error!(
+                            "Window {} pipeline GStreamer ERROR: {} (debug: {:?})",
+                            wid_for_bus,
+                            err.error(),
+                            err.debug()
+                        );
+                    }
+                    MessageView::Warning(w) => {
+                        tracing::warn!(
+                            "Window {} pipeline GStreamer WARNING: {} (debug: {:?})",
+                            wid_for_bus,
+                            w.error(),
+                            w.debug()
+                        );
+                    }
+                    _ => {}
                 }
-                MessageView::Warning(w) => {
-                    tracing::warn!(
-                        "Window {} pipeline GStreamer WARNING: {} (debug: {:?})",
-                        wid_for_bus,
-                        w.error(),
-                        w.debug()
-                    );
-                }
-                _ => {}
-            }
-            gstreamer::glib::ControlFlow::Continue
-        })
-        .context("Failed to add bus watch")?;
+                gstreamer::glib::ControlFlow::Continue
+            })
+            .context("Failed to add bus watch")?;
 
         pipeline
             .set_state(gstreamer::State::Playing)

@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -24,6 +24,10 @@ pub struct CoherenceState {
     /// Set to false during resize (before Xvfb kill), set to true when window
     /// monitor reconnects and re-enables Composite (on Snapshot event).
     pub composite_ready: Arc<AtomicBool>,
+    /// Current Xvfb display dimensions (packed as width << 16 | height).
+    /// Used to clamp per-window resize requests so windows never exceed
+    /// the virtual display bounds (which causes Composite BadMatch errors).
+    pub display_size: Arc<AtomicU32>,
 }
 
 impl CoherenceState {
@@ -44,6 +48,7 @@ pub struct CoherenceSession {
     pipeline_manager: Arc<Mutex<WindowPipelineManager>>,
     window_manager: Arc<WindowManager>,
     subscriptions: HashMap<u32, JoinHandle<()>>,
+    display_size: Arc<AtomicU32>,
 }
 
 impl CoherenceSession {
@@ -53,6 +58,7 @@ impl CoherenceSession {
             pipeline_manager: state.pipeline_manager.clone(),
             window_manager: state.window_manager.clone(),
             subscriptions: HashMap::new(),
+            display_size: state.display_size.clone(),
         }
     }
 
@@ -109,11 +115,31 @@ impl CoherenceSession {
         // Round up to even dimensions — x264enc / I420 (4:2:0 chroma subsampling)
         // requires even width and height; odd values cause silent cap negotiation
         // failure resulting in 0 fps (black screen).
-        let width = (width + 1) & !1;
-        let height = (height + 1) & !1;
+        let mut width = (width + 1) & !1;
+        let mut height = (height + 1) & !1;
+
+        // Clamp to the current display dimensions — a window exceeding the Xvfb
+        // display bounds causes Composite BadMatch errors every frame, resulting
+        // in black/corrupt captures.
+        let packed = self.display_size.load(std::sync::atomic::Ordering::Relaxed);
+        let display_w = (packed >> 16) as u16;
+        let display_h = (packed & 0xFFFF) as u16;
+        if display_w > 0
+            && display_h > 0
+            && (width > display_w || height > display_h)
+        {
+            let clamped_w = width.min(display_w);
+            let clamped_h = height.min(display_h);
+            info!(
+                "Clamping window {} resize from {}x{} to {}x{} (display is {}x{})",
+                window_id, width, height, clamped_w, clamped_h, display_w, display_h
+            );
+            width = clamped_w;
+            height = clamped_h;
+        }
 
         info!(
-            "Resizing coherence window {} to {}x{} (rounded to even)",
+            "Resizing coherence window {} to {}x{}",
             window_id, width, height
         );
 

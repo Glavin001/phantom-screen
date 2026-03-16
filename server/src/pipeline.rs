@@ -318,6 +318,15 @@ impl PipelineManager {
         self.controller.lock().unwrap().set_bitrate(kbps);
     }
 
+    /// Returns the current display resolution as (width, height).
+    pub fn current_resolution(&self) -> (u16, u16) {
+        let config = self.config.lock().unwrap();
+        (
+            config.resolution_width() as u16,
+            config.resolution_height() as u16,
+        )
+    }
+
     /// Create a dummy manager for testing (no real GStreamer pipeline or display).
     #[cfg(test)]
     pub(crate) fn new_for_test(running: bool) -> Arc<Self> {

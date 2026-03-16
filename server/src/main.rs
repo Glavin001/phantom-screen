@@ -144,12 +144,20 @@ async fn main() -> Result<()> {
                 .context("Failed to create window manager")?,
         );
 
+        // Pack initial display dimensions as (width << 16 | height)
+        let initial_w = config.resolution_width();
+        let initial_h = config.resolution_height();
+        let display_size = Arc::new(std::sync::atomic::AtomicU32::new(
+            (initial_w << 16) | (initial_h & 0xFFFF),
+        ));
+
         Arc::new(coherence::CoherenceState {
             window_events: window_event_tx,
             tracked_windows,
             pipeline_manager,
             window_manager,
             composite_ready,
+            display_size,
         })
     };
     info!("Coherence mode support initialized");
@@ -722,7 +730,12 @@ async fn process_input_data_with_coherence(
                 }
                 _ => {
                     // Regular input events - dispatch normally
-                    if let Err(e) = dispatch_event(&event, input_handler, pipeline_manager) {
+                    if let Err(e) = dispatch_event(
+                        &event,
+                        input_handler,
+                        pipeline_manager,
+                        Some(&coherence_state.display_size),
+                    ) {
                         warn!("Failed to dispatch input event: {}", e);
                     }
                 }
@@ -786,7 +799,7 @@ fn process_input_data(
         }
 
         if let Some(event) = parse_input_event(&remaining[..event_len])
-            && let Err(e) = dispatch_event(&event, input_handler, pipeline_manager)
+            && let Err(e) = dispatch_event(&event, input_handler, pipeline_manager, None)
         {
             warn!("Failed to dispatch input event: {}", e);
         }
@@ -898,6 +911,7 @@ fn dispatch_event(
     event: &InputEvent,
     input_handler: &InputHandler,
     pipeline_manager: &Arc<PipelineManager>,
+    display_size: Option<&Arc<std::sync::atomic::AtomicU32>>,
 ) -> Result<()> {
     match event {
         InputEvent::MouseMove { x, y } => input_handler.mouse_move(*x, *y)?,
@@ -910,7 +924,7 @@ fn dispatch_event(
         InputEvent::RequestKeyframe
         | InputEvent::SetBitrate { .. }
         | InputEvent::SetResolution { .. } => {
-            control::handle_control_event(event, pipeline_manager);
+            control::handle_control_event(event, pipeline_manager, display_size);
         }
         // Coherence events are handled in process_input_data_with_coherence
         InputEvent::EnableCoherence
