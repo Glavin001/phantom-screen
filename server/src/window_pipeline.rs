@@ -19,6 +19,9 @@ struct WindowPipeline {
     tx: broadcast::Sender<EncodedFrame>,
     running: AtomicBool,
     _bus_watch: Option<gstreamer::bus::BusWatchGuard>,
+    /// Holds the X11 connection that owns the per-window Composite redirect.
+    /// When this is dropped, the redirect is automatically released by the X server.
+    _composite_conn: Option<x11rb::rust_connection::RustConnection>,
 }
 
 impl WindowPipeline {
@@ -92,6 +95,14 @@ impl WindowPipelineManager {
                 self.max_pipelines
             );
         }
+
+        // Explicitly redirect this specific window for Composite capture.
+        // Composite redirection is per-X-client, so the root-level
+        // redirect_subwindows from the window monitor doesn't cover ximagesrc's
+        // own Xlib connection.  By holding this redirect for the lifetime of
+        // the pipeline, we ensure ximagesrc can call NameWindowPixmap without
+        // BadMatch errors.
+        let composite_conn = redirect_window_composite(&self.display, window_id);
 
         let pipeline_str = build_window_pipeline_string(
             &self.display,
@@ -202,6 +213,7 @@ impl WindowPipelineManager {
             tx,
             running: AtomicBool::new(true),
             _bus_watch: Some(bus_watch),
+            _composite_conn: composite_conn,
         };
 
         self.pipelines.insert(window_id, wp);
@@ -259,6 +271,57 @@ impl WindowPipelineManager {
     /// Number of active pipelines.
     pub fn active_count(&self) -> usize {
         self.pipelines.len()
+    }
+}
+
+/// Open a dedicated X11 connection and redirect the given window for Composite
+/// capture.  The returned connection must be kept alive for as long as the
+/// pipeline is running — when the connection is dropped, the X server
+/// automatically un-redirects the window.
+///
+/// We use `Redirect::AUTOMATIC` so the X server still paints the window to
+/// screen, while also maintaining an offscreen pixmap that ximagesrc can
+/// capture via `CompositeNameWindowPixmap`.
+fn redirect_window_composite(
+    x_display: &str,
+    window_id: u32,
+) -> Option<x11rb::rust_connection::RustConnection> {
+    use x11rb::protocol::composite;
+
+    let (conn, _screen) = match x11rb::rust_connection::RustConnection::connect(Some(x_display)) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "Cannot connect to {} for composite redirect of window {}: {}",
+                x_display,
+                window_id,
+                e
+            );
+            return None;
+        }
+    };
+
+    // Send the redirect request and check the result, ensuring the borrow
+    // of `conn` is released before we try to move it.
+    let result = composite::redirect_window(&conn, window_id, composite::Redirect::AUTOMATIC)
+        .and_then(|cookie| Ok(cookie.check()));
+    match result {
+        Ok(Ok(())) => {
+            tracing::debug!("Composite redirect_window({}) OK", window_id);
+            Some(conn)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Composite redirect_window({}) failed: {}", window_id, e);
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Composite redirect_window({}) request error: {}",
+                window_id,
+                e
+            );
+            None
+        }
     }
 }
 
