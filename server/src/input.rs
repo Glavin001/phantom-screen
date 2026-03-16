@@ -6,9 +6,10 @@ use x11rb::protocol::xtest::ConnectionExt as XTestExt;
 
 /// Manages X11 input injection via XTest extension
 pub struct InputHandler {
-    conn: x11rb::rust_connection::RustConnection,
+    display: String,
+    conn: std::sync::Mutex<x11rb::rust_connection::RustConnection>,
     screen_num: usize,
-    keycode_map: HashMap<String, u8>,
+    keycode_map: std::sync::Mutex<HashMap<String, u8>>,
 }
 
 impl InputHandler {
@@ -16,6 +17,32 @@ impl InputHandler {
         // Set DISPLAY env var for x11rb
         // SAFETY: called before spawning threads, only modifies DISPLAY
         unsafe { std::env::set_var("DISPLAY", disp) };
+        let (conn, screen_num, keycode_map) = Self::connect(disp)?;
+
+        Ok(Self {
+            display: disp.to_string(),
+            conn: std::sync::Mutex::new(conn),
+            screen_num,
+            keycode_map: std::sync::Mutex::new(keycode_map),
+        })
+    }
+
+    /// Reconnect to the X11 display after an Xvfb restart.
+    pub fn reconnect(&self) -> Result<()> {
+        let (conn, _screen_num, keycode_map) = Self::connect(&self.display)?;
+        *self.conn.lock().unwrap() = conn;
+        *self.keycode_map.lock().unwrap() = keycode_map;
+        tracing::info!("Input handler reconnected to display {}", self.display);
+        Ok(())
+    }
+
+    fn connect(
+        disp: &str,
+    ) -> Result<(
+        x11rb::rust_connection::RustConnection,
+        usize,
+        HashMap<String, u8>,
+    )> {
         let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(disp))
             .context("Failed to connect to X11 display")?;
 
@@ -33,18 +60,14 @@ impl InputHandler {
             keycode_map.len()
         );
 
-        Ok(Self {
-            conn,
-            screen_num,
-            keycode_map,
-        })
+        Ok((conn, screen_num, keycode_map))
     }
 
     /// Inject a mouse move event
     pub fn mouse_move(&self, x: u16, y: u16) -> Result<()> {
-        let root = self.root_window();
-        self.conn
-            .xtest_fake_input(6, 0, 0, root, x as i16, y as i16, 0)?
+        let conn = self.conn.lock().unwrap();
+        let root = Self::root_window_from(&conn, self.screen_num);
+        conn.xtest_fake_input(6, 0, 0, root, x as i16, y as i16, 0)?
             .check()
             .context("Failed to inject mouse move")?;
         Ok(())
@@ -52,10 +75,10 @@ impl InputHandler {
 
     /// Inject a mouse button press/release
     pub fn mouse_button(&self, button: u8, pressed: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
         let event_type = if pressed { 4 } else { 5 }; // ButtonPress / ButtonRelease
-        let root = self.root_window();
-        self.conn
-            .xtest_fake_input(event_type, button, 0, root, 0, 0, 0)?
+        let root = Self::root_window_from(&conn, self.screen_num);
+        conn.xtest_fake_input(event_type, button, 0, root, 0, 0, 0)?
             .check()
             .context("Failed to inject mouse button")?;
         Ok(())
@@ -63,19 +86,18 @@ impl InputHandler {
 
     /// Inject a mouse scroll event
     pub fn mouse_scroll(&self, dx: i16, dy: i16) -> Result<()> {
-        let root = self.root_window();
+        let conn = self.conn.lock().unwrap();
+        let root = Self::root_window_from(&conn, self.screen_num);
         // Vertical scroll: button 4 (up) or 5 (down)
         if dy != 0 {
             let button = if dy < 0 { 4u8 } else { 5u8 };
             let clicks = dy.unsigned_abs();
             for _ in 0..clicks {
                 // Press
-                self.conn
-                    .xtest_fake_input(4, button, 0, root, 0, 0, 0)?
+                conn.xtest_fake_input(4, button, 0, root, 0, 0, 0)?
                     .check()?;
                 // Release
-                self.conn
-                    .xtest_fake_input(5, button, 0, root, 0, 0, 0)?
+                conn.xtest_fake_input(5, button, 0, root, 0, 0, 0)?
                     .check()?;
             }
         }
@@ -84,11 +106,9 @@ impl InputHandler {
             let button = if dx < 0 { 6u8 } else { 7u8 };
             let clicks = dx.unsigned_abs();
             for _ in 0..clicks {
-                self.conn
-                    .xtest_fake_input(4, button, 0, root, 0, 0, 0)?
+                conn.xtest_fake_input(4, button, 0, root, 0, 0, 0)?
                     .check()?;
-                self.conn
-                    .xtest_fake_input(5, button, 0, root, 0, 0, 0)?
+                conn.xtest_fake_input(5, button, 0, root, 0, 0, 0)?
                     .check()?;
             }
         }
@@ -99,15 +119,17 @@ impl InputHandler {
     pub fn key_event(&self, code: &str, pressed: bool) -> Result<()> {
         let keycode = self
             .keycode_map
+            .lock()
+            .unwrap()
             .get(code)
             .copied()
             .or_else(|| dom_code_to_keycode_fallback(code))
             .context(format!("Unknown key code: {code}"))?;
 
+        let conn = self.conn.lock().unwrap();
         let event_type = if pressed { 2 } else { 3 }; // KeyPress / KeyRelease
-        let root = self.root_window();
-        self.conn
-            .xtest_fake_input(event_type, keycode, 0, root, 0, 0, 0)?
+        let root = Self::root_window_from(&conn, self.screen_num);
+        conn.xtest_fake_input(event_type, keycode, 0, root, 0, 0, 0)?
             .check()
             .context("Failed to inject key event")?;
         Ok(())
@@ -139,8 +161,11 @@ impl InputHandler {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    fn root_window(&self) -> xproto::Window {
-        self.conn.setup().roots[self.screen_num].root
+    fn root_window_from(
+        conn: &x11rb::rust_connection::RustConnection,
+        screen_num: usize,
+    ) -> xproto::Window {
+        conn.setup().roots[screen_num].root
     }
 }
 

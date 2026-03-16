@@ -363,7 +363,9 @@ export class PhantomScreenClient {
         this.controlManager?.recordFrame(drawTime);
       },
       error: () => {
-        this.controlManager?.requestKeyframe();
+        // After an error the decoder enters "closed" state and cannot be reused.
+        // Recreate it so the next keyframe can be decoded (e.g. after a resize).
+        this.resetDecoder();
       },
     });
 
@@ -372,6 +374,18 @@ export class PhantomScreenClient {
       hardwareAcceleration: this.options.decoderHardwareAcceleration ?? 'prefer-software',
       optimizeForLatency: true,
     });
+  }
+
+  /** Recreate the decoder after it enters the "closed" error state (e.g. resolution change). */
+  private resetDecoder(): void {
+    try {
+      this.decoder?.close();
+    } catch {
+      // Already closed.
+    }
+    this.decoder = null;
+    this.setupDecoder();
+    this.controlManager?.requestKeyframe();
   }
 
   private async readVideoStreams(transport: WebTransport): Promise<void> {
@@ -468,8 +482,18 @@ export class PhantomScreenClient {
     const pts = ptsHigh * 0x100000000 + ptsLow;
     const payloadLength = view.getUint32(9, false);
 
-    if (data.length < 13 + payloadLength || !this.decoder || this.decoder.state === 'closed') {
+    if (data.length < 13 + payloadLength || !this.decoder) {
       return;
+    }
+
+    // If the decoder entered "closed" state (e.g. after a resolution change caused
+    // a decode error), recreate it so we can decode frames from the new pipeline.
+    if (this.decoder.state === 'closed') {
+      this.resetDecoder();
+      // After reset we need a keyframe; drop delta frames until one arrives.
+      if (!isKeyframe) {
+        return;
+      }
     }
 
     try {
@@ -480,7 +504,7 @@ export class PhantomScreenClient {
       });
       this.decoder.decode(chunk);
     } catch {
-      this.controlManager?.requestKeyframe();
+      this.resetDecoder();
     }
   }
 

@@ -18,12 +18,19 @@ struct WindowPipeline {
     pipeline: gstreamer::Pipeline,
     tx: broadcast::Sender<EncodedFrame>,
     running: AtomicBool,
+    _bus_watch: Option<gstreamer::bus::BusWatchGuard>,
+    /// Holds the X11 connection that owns the per-window Composite redirect.
+    /// When this is dropped, the redirect is automatically released by the X server.
+    _composite_conn: Option<x11rb::rust_connection::RustConnection>,
 }
 
 impl WindowPipeline {
     fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
         let _ = self.pipeline.set_state(gstreamer::State::Null);
+        // Wait for state change to complete so ximagesrc closes its X connection
+        // before Xvfb is killed during resize
+        let _ = self.pipeline.state(gstreamer::ClockTime::from_seconds(1));
     }
 
     fn pause(&self) {
@@ -68,6 +75,19 @@ impl WindowPipelineManager {
             return Ok(wp.tx.subscribe());
         }
 
+        // Validate the window still exists before creating a GStreamer pipeline.
+        // GStreamer's ximagesrc uses Xlib internally and will trigger X errors
+        // (potentially fatal without our custom error handler) if the window
+        // ID is stale (e.g., from before an Xvfb restart).
+        if !validate_window_exists(&self.display, window_id) {
+            anyhow::bail!(
+                "Window {} (0x{:x}) does not exist on display {} — refusing to start pipeline",
+                window_id,
+                window_id,
+                self.display
+            );
+        }
+
         // Check pipeline limit
         if self.pipelines.len() as u32 >= self.max_pipelines {
             anyhow::bail!(
@@ -75,6 +95,14 @@ impl WindowPipelineManager {
                 self.max_pipelines
             );
         }
+
+        // Explicitly redirect this specific window for Composite capture.
+        // Composite redirection is per-X-client, so the root-level
+        // redirect_subwindows from the window monitor doesn't cover ximagesrc's
+        // own Xlib connection.  By holding this redirect for the lifetime of
+        // the pipeline, we ensure ximagesrc can call NameWindowPixmap without
+        // BadMatch errors.
+        let composite_conn = redirect_window_composite(&self.display, window_id);
 
         let pipeline_str = build_window_pipeline_string(
             &self.display,
@@ -146,6 +174,36 @@ impl WindowPipelineManager {
                 .build(),
         );
 
+        // Watch for GStreamer bus errors/warnings to diagnose pipeline failures
+        // (e.g., ximagesrc cap negotiation failure with odd dimensions).
+        let bus = pipeline.bus().context("No bus on pipeline")?;
+        let wid_for_bus = window_id;
+        let bus_watch = bus
+            .add_watch(move |_, msg| {
+                use gstreamer::MessageView;
+                match msg.view() {
+                    MessageView::Error(err) => {
+                        tracing::error!(
+                            "Window {} pipeline GStreamer ERROR: {} (debug: {:?})",
+                            wid_for_bus,
+                            err.error(),
+                            err.debug()
+                        );
+                    }
+                    MessageView::Warning(w) => {
+                        tracing::warn!(
+                            "Window {} pipeline GStreamer WARNING: {} (debug: {:?})",
+                            wid_for_bus,
+                            w.error(),
+                            w.debug()
+                        );
+                    }
+                    _ => {}
+                }
+                gstreamer::glib::ControlFlow::Continue
+            })
+            .context("Failed to add bus watch")?;
+
         pipeline
             .set_state(gstreamer::State::Playing)
             .context("Failed to start per-window pipeline")?;
@@ -154,6 +212,8 @@ impl WindowPipelineManager {
             pipeline,
             tx,
             running: AtomicBool::new(true),
+            _bus_watch: Some(bus_watch),
+            _composite_conn: composite_conn,
         };
 
         self.pipelines.insert(window_id, wp);
@@ -211,6 +271,92 @@ impl WindowPipelineManager {
     /// Number of active pipelines.
     pub fn active_count(&self) -> usize {
         self.pipelines.len()
+    }
+}
+
+/// Open a dedicated X11 connection and redirect the given window for Composite
+/// capture.  The returned connection must be kept alive for as long as the
+/// pipeline is running — when the connection is dropped, the X server
+/// automatically un-redirects the window.
+///
+/// We use `Redirect::AUTOMATIC` so the X server still paints the window to
+/// screen, while also maintaining an offscreen pixmap that ximagesrc can
+/// capture via `CompositeNameWindowPixmap`.
+fn redirect_window_composite(
+    x_display: &str,
+    window_id: u32,
+) -> Option<x11rb::rust_connection::RustConnection> {
+    use x11rb::protocol::composite;
+
+    let (conn, _screen) = match x11rb::rust_connection::RustConnection::connect(Some(x_display)) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "Cannot connect to {} for composite redirect of window {}: {}",
+                x_display,
+                window_id,
+                e
+            );
+            return None;
+        }
+    };
+
+    // Send the redirect request and check the result, ensuring the borrow
+    // of `conn` is released before we try to move it.
+    let result = composite::redirect_window(&conn, window_id, composite::Redirect::AUTOMATIC)
+        .map(|cookie| cookie.check());
+    match result {
+        Ok(Ok(())) => {
+            tracing::debug!("Composite redirect_window({}) OK", window_id);
+            Some(conn)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Composite redirect_window({}) failed: {}", window_id, e);
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Composite redirect_window({}) request error: {}",
+                window_id,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Check if a window ID is valid on the given display using x11rb.
+///
+/// This uses the Rust x11rb library (not Xlib), which handles X errors
+/// gracefully via Result types instead of calling exit().
+fn validate_window_exists(x_display: &str, window_id: u32) -> bool {
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    let conn = match x11rb::rust_connection::RustConnection::connect(Some(x_display)) {
+        Ok((conn, _)) => conn,
+        Err(e) => {
+            tracing::warn!("Cannot connect to {} to validate window: {}", x_display, e);
+            return false;
+        }
+    };
+
+    match conn.get_window_attributes(window_id) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "Window 0x{:x} does not exist on {}: {}",
+                    window_id,
+                    x_display,
+                    e
+                );
+                false
+            }
+        },
+        Err(e) => {
+            tracing::warn!("Failed to query window 0x{:x}: {}", window_id, e);
+            false
+        }
     }
 }
 

@@ -6,11 +6,13 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::pipeline::EncodedFrame;
+use crate::pipeline::{EncodedFrame, clamp_to_display, round_to_even, unpack_display_size};
 use crate::window_monitor::{TrackedWindows, WindowEvent, WindowManager};
 use crate::window_pipeline::WindowPipelineManager;
 
@@ -20,6 +22,13 @@ pub struct CoherenceState {
     pub tracked_windows: TrackedWindows,
     pub pipeline_manager: Arc<Mutex<WindowPipelineManager>>,
     pub window_manager: Arc<WindowManager>,
+    /// Set to false during resize (before Xvfb kill), set to true when window
+    /// monitor reconnects and re-enables Composite (on Snapshot event).
+    pub composite_ready: Arc<AtomicBool>,
+    /// Current Xvfb display dimensions (packed as width << 16 | height).
+    /// Used to clamp per-window resize requests so windows never exceed
+    /// the virtual display bounds (which causes Composite BadMatch errors).
+    pub display_size: Arc<AtomicU32>,
 }
 
 impl CoherenceState {
@@ -40,6 +49,11 @@ pub struct CoherenceSession {
     pipeline_manager: Arc<Mutex<WindowPipelineManager>>,
     window_manager: Arc<WindowManager>,
     subscriptions: HashMap<u32, JoinHandle<()>>,
+    display_size: Arc<AtomicU32>,
+    /// Tracks when each window's pipeline was last restarted.
+    /// Used to enforce a minimum cooldown between restarts to avoid
+    /// overwhelming the X server with rapid pipeline create/destroy cycles.
+    last_restart: HashMap<u32, std::time::Instant>,
 }
 
 impl CoherenceSession {
@@ -49,6 +63,8 @@ impl CoherenceSession {
             pipeline_manager: state.pipeline_manager.clone(),
             window_manager: state.window_manager.clone(),
             subscriptions: HashMap::new(),
+            display_size: state.display_size.clone(),
+            last_restart: HashMap::new(),
         }
     }
 
@@ -58,7 +74,7 @@ impl CoherenceSession {
         &mut self,
         window_id: u32,
     ) -> Result<broadcast::Receiver<EncodedFrame>> {
-        let mut mgr = self.pipeline_manager.lock().await;
+        let mut mgr = self.pipeline_manager.lock().unwrap();
         let rx = mgr.start_window(window_id)?;
         info!("Session subscribed to window {}", window_id);
         Ok(rx)
@@ -94,9 +110,128 @@ impl CoherenceSession {
         }
     }
 
-    /// Resize a remote X11 window.
-    pub fn resize_window(&self, window_id: u32, width: u16, height: u16) -> Result<()> {
+    /// Normalize dimensions for a coherence window resize: round to even,
+    /// clamp to display bounds.
+    pub fn normalize_resize(&self, window_id: u32, width: u16, height: u16) -> (u16, u16) {
+        let mut width = round_to_even(width);
+        let mut height = round_to_even(height);
+
+        let packed = self.display_size.load(std::sync::atomic::Ordering::Acquire);
+        let (display_w, display_h) = unpack_display_size(packed);
+        let (clamped_w, clamped_h) = clamp_to_display(width, height, display_w, display_h);
+        if clamped_w != width || clamped_h != height {
+            info!(
+                "Clamping window {} resize from {}x{} to {}x{} (display is {}x{})",
+                window_id, width, height, clamped_w, clamped_h, display_w, display_h
+            );
+            width = clamped_w;
+            height = clamped_h;
+        }
+        (width, height)
+    }
+
+    /// Resize the X11 window immediately (fast, just an X protocol request).
+    /// Call this for every resize event so the window tracks the user's mouse.
+    pub fn resize_x11_window(&self, window_id: u32, width: u16, height: u16) -> Result<()> {
         self.window_manager.resize(window_id, width, height)
+    }
+
+    /// Stop a window's per-window pipeline (e.g., before resize).
+    /// This fully tears down the GStreamer pipeline and releases its X connection,
+    /// preventing BadMatch errors from ximagesrc accessing a stale composite pixmap
+    /// while the window geometry is changing.  GStreamer's PAUSED state is NOT
+    /// sufficient — ximagesrc still performs X operations in PAUSED.
+    pub fn stop_window_pipeline(&self, window_id: u32) {
+        let mut mgr = self.pipeline_manager.lock().unwrap();
+        mgr.stop_window(window_id);
+    }
+
+    /// Restart just the per-window pipeline (debounced path).
+    /// Called after a quiet period to avoid restarting on every resize event.
+    ///
+    /// `expected_size` is the (width, height) we asked for.  Before starting
+    /// the new pipeline we poll the X server until the window's actual geometry
+    /// matches (the WM may take a while to process our ConfigureWindow).
+    ///
+    /// Enforces a minimum 500ms cooldown between restarts for the same window
+    /// to prevent overwhelming Xvfb with rapid pipeline create/destroy cycles.
+    pub async fn restart_window_pipeline(
+        &mut self,
+        window_id: u32,
+        expected_size: Option<(u16, u16)>,
+    ) -> Result<Option<broadcast::Receiver<EncodedFrame>>> {
+        // Enforce minimum cooldown between pipeline restarts for the same window.
+        const MIN_RESTART_INTERVAL_MS: u64 = 500;
+        if let Some(last) = self.last_restart.get(&window_id) {
+            let elapsed = last.elapsed();
+            if elapsed < std::time::Duration::from_millis(MIN_RESTART_INTERVAL_MS) {
+                let remaining = std::time::Duration::from_millis(MIN_RESTART_INTERVAL_MS) - elapsed;
+                debug!(
+                    "Window {} pipeline restart cooldown: waiting {}ms",
+                    window_id,
+                    remaining.as_millis()
+                );
+                tokio::time::sleep(remaining).await;
+            }
+        }
+        // Flush pending X requests so the WM receives our ConfigureWindow.
+        let _ = self.window_manager.sync();
+
+        // Poll until the window geometry matches what we asked for, or give up
+        // after ~1s.  The WM (openbox) processes the resize asynchronously —
+        // if we start ximagesrc before it finishes, the WM's later resize will
+        // invalidate the composite pixmap and ximagesrc enters a permanent
+        // BadMatch loop.
+        if let Some((ew, eh)) = expected_size {
+            for attempt in 0..20 {
+                match self.window_manager.get_geometry(window_id) {
+                    Ok((aw, ah)) if aw == ew && ah == eh => {
+                        if attempt > 0 {
+                            info!(
+                                "Window {} geometry settled to {}x{} after {}ms",
+                                window_id,
+                                aw,
+                                ah,
+                                attempt * 50
+                            );
+                        }
+                        break;
+                    }
+                    Ok((aw, ah)) => {
+                        if attempt == 0 {
+                            debug!(
+                                "Window {} geometry {}x{}, waiting for {}x{}",
+                                window_id, aw, ah, ew, eh
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(_) => {
+                        // Window may have been destroyed; give up.
+                        warn!(
+                            "Window {} geometry query failed, skipping pipeline restart",
+                            window_id
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+        } else {
+            // No expected size — just a brief settle delay.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let mut mgr = self.pipeline_manager.lock().unwrap();
+        // Use start_window (not restart_window) because the pipeline may have
+        // been fully stopped before the X11 resize to prevent BadMatch errors.
+        // start_window handles both cases: if already running it forces a
+        // keyframe; if stopped it creates a fresh pipeline.
+        let rx = mgr.start_window(window_id)?;
+        drop(mgr);
+        self.last_restart
+            .insert(window_id, std::time::Instant::now());
+        info!("Restarted per-window pipeline for window {}", window_id);
+        Ok(Some(rx))
     }
 
     /// Focus/raise a remote X11 window.
@@ -307,5 +442,56 @@ mod tests {
         assert_eq!(data[0], 0x40);
         assert_eq!(data[1], 0x06);
         assert_eq!(data[6], 0); // not visible
+    }
+
+    // --- Resize dimension processing tests ---
+    // These test the full pipeline: round_to_even → clamp_to_display
+
+    #[test]
+    fn resize_dimensions_odd_rounded_then_clamped() {
+        // Odd 1921x1081 → rounds to 1922x1082 → clamped to 1920x1080
+        let w = round_to_even(1921);
+        let h = round_to_even(1081);
+        assert_eq!((w, h), (1922, 1082));
+        let (cw, ch) = clamp_to_display(w, h, 1920, 1080);
+        assert_eq!((cw, ch), (1920, 1080));
+    }
+
+    #[test]
+    fn resize_dimensions_zero_gets_minimum() {
+        let w = round_to_even(0);
+        let h = round_to_even(0);
+        assert_eq!((w, h), (2, 2));
+        // Within any reasonable display
+        let (cw, ch) = clamp_to_display(w, h, 1920, 1080);
+        assert_eq!((cw, ch), (2, 2));
+    }
+
+    #[test]
+    fn resize_dimensions_u16_max_rounded_and_clamped() {
+        // u16::MAX (65535) → rounds to 65534 → clamped to display
+        let w = round_to_even(u16::MAX);
+        let h = round_to_even(u16::MAX);
+        assert_eq!((w, h), (65534, 65534));
+        let (cw, ch) = clamp_to_display(w, h, 1920, 1080);
+        assert_eq!((cw, ch), (1920, 1080));
+    }
+
+    #[test]
+    fn resize_dimensions_display_uninitialized_passthrough() {
+        // When display_size hasn't been set (packed=0), don't clamp
+        let (dw, dh) = crate::pipeline::unpack_display_size(0);
+        assert_eq!((dw, dh), (0, 0));
+        let (cw, ch) = clamp_to_display(800, 600, dw, dh);
+        assert_eq!((cw, ch), (800, 600));
+    }
+
+    #[test]
+    fn resize_dimensions_within_display_unchanged() {
+        let w = round_to_even(800);
+        let h = round_to_even(600);
+        assert_eq!((w, h), (800, 600));
+        let (cw, ch) = clamp_to_display(w, h, 1920, 1080);
+        assert_eq!((cw, ch), (800, 600));
     }
 }

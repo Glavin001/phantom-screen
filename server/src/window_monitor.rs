@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::broadcast;
 use x11rb::connection::Connection;
+use x11rb::protocol::composite::{self};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 /// Shared snapshot of currently tracked windows, updated by the monitor thread.
 pub type TrackedWindows = Arc<StdMutex<HashMap<u32, WindowInfo>>>;
@@ -213,10 +215,43 @@ fn run_monitor_loop(
     tx: &broadcast::Sender<WindowEvent>,
     shared_tracked: &TrackedWindows,
 ) -> Result<()> {
+    loop {
+        match run_monitor_session(display, tx, shared_tracked) {
+            Ok(()) => {
+                tracing::info!("Window monitor session ended cleanly");
+            }
+            Err(e) => {
+                tracing::warn!("Window monitor session error: {}", e);
+            }
+        }
+
+        // Clear stale tracked windows — old window IDs are invalid after Xvfb restart
+        if let Ok(mut shared) = shared_tracked.lock() {
+            shared.clear();
+        }
+
+        // Wait for the new X server to be ready before reconnecting
+        tracing::info!("Window monitor will reconnect in 2s...");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+fn run_monitor_session(
+    display: &str,
+    tx: &broadcast::Sender<WindowEvent>,
+    shared_tracked: &TrackedWindows,
+) -> Result<()> {
     let (conn, screen_num) = RustConnection::connect(Some(display))
         .context("Failed to connect to X11 for monitoring")?;
     let root = conn.setup().roots[screen_num].root;
     let atoms = Atoms::intern(&conn)?;
+
+    // Enable X Composite extension: redirect all child windows to offscreen pixmaps
+    // so ximagesrc can capture each window independently even when overlapped.
+    composite::redirect_subwindows(&conn, root, composite::Redirect::AUTOMATIC)?
+        .check()
+        .context("Failed to enable Composite redirection on root window")?;
+    tracing::info!("X Composite: redirected subwindows for independent capture");
 
     // Subscribe to substructure notify on root (window create/destroy/reparent/configure)
     conn.change_window_attributes(
@@ -233,7 +268,10 @@ fn run_monitor_loop(
     enumerate_windows(&conn, root, &atoms, &mut tracked)?;
 
     let snapshot: Vec<WindowInfo> = tracked.values().cloned().collect();
-    tracing::info!("Window monitor started, found {} windows", snapshot.len());
+    tracing::info!(
+        "Window monitor reconnected, found {} windows",
+        snapshot.len()
+    );
     // Update shared state so late subscribers can get a fresh snapshot
     if let Ok(mut shared) = shared_tracked.lock() {
         *shared = tracked.clone();
@@ -245,8 +283,8 @@ fn run_monitor_loop(
         let event = match conn.wait_for_event() {
             Ok(e) => e,
             Err(e) => {
-                tracing::error!("X11 event error: {}", e);
-                break;
+                tracing::warn!("X11 connection lost: {}", e);
+                return Err(e.into());
             }
         };
 
@@ -406,8 +444,6 @@ fn run_monitor_loop(
             *shared = tracked.clone();
         }
     }
-
-    Ok(())
 }
 
 /// Enumerate existing windows at startup.
@@ -659,28 +695,68 @@ pub fn close_window(conn: &RustConnection, window: u32, atoms: &Atoms) -> Result
 
 /// Public interface for window management operations from coherence sessions.
 pub struct WindowManager {
-    conn: RustConnection,
-    atoms: Atoms,
+    display: String,
+    conn: std::sync::Mutex<RustConnection>,
+    atoms: std::sync::Mutex<Atoms>,
 }
 
 impl WindowManager {
     pub fn new(display: &str) -> Result<Self> {
+        let (conn, atoms) = Self::connect(display)?;
+        Ok(Self {
+            display: display.to_string(),
+            conn: std::sync::Mutex::new(conn),
+            atoms: std::sync::Mutex::new(atoms),
+        })
+    }
+
+    /// Reconnect to the X11 display after an Xvfb restart.
+    pub fn reconnect(&self) -> Result<()> {
+        let (conn, atoms) = Self::connect(&self.display)?;
+        *self.conn.lock().unwrap() = conn;
+        *self.atoms.lock().unwrap() = atoms;
+        tracing::info!("WindowManager reconnected to display {}", self.display);
+        Ok(())
+    }
+
+    fn connect(display: &str) -> Result<(RustConnection, Atoms)> {
         let (conn, _screen_num) = RustConnection::connect(Some(display))
             .context("Failed to connect to X11 for window management")?;
         let atoms = Atoms::intern(&conn)?;
-        Ok(Self { conn, atoms })
+        Ok((conn, atoms))
     }
 
     pub fn resize(&self, window_id: u32, width: u16, height: u16) -> Result<()> {
-        resize_window(&self.conn, window_id, width, height)
+        let conn = self.conn.lock().unwrap();
+        resize_window(&conn, window_id, width, height)
     }
 
     pub fn raise(&self, window_id: u32) -> Result<()> {
-        raise_window(&self.conn, window_id)
+        let conn = self.conn.lock().unwrap();
+        raise_window(&conn, window_id)
     }
 
     pub fn close(&self, window_id: u32) -> Result<()> {
-        close_window(&self.conn, window_id, &self.atoms)
+        let conn = self.conn.lock().unwrap();
+        let atoms = self.atoms.lock().unwrap();
+        close_window(&conn, window_id, &atoms)
+    }
+
+    /// Query the actual geometry of a window from the X server.
+    pub fn get_geometry(&self, window_id: u32) -> Result<(u16, u16)> {
+        let conn = self.conn.lock().unwrap();
+        let geom = conn
+            .get_geometry(window_id)?
+            .reply()
+            .context("Failed to get window geometry")?;
+        Ok((geom.width, geom.height))
+    }
+
+    /// Flush all pending requests and wait for the X server to process them.
+    pub fn sync(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.sync().context("X11 sync failed")?;
+        Ok(())
     }
 }
 

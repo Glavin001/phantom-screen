@@ -14,6 +14,7 @@
 import {
   attachInputListeners,
   encodeFocusWindow,
+  encodeResizeWindow,
   encodeUnsubscribeWindow,
   type InputSender,
 } from './input';
@@ -40,8 +41,7 @@ export class WindowPopup {
   private decoderAcceleration: VideoDecoderConfig['hardwareAcceleration'];
   private lastKeyframeRequestTime = 0;
   private unloadHandled = false;
-  /** Only used in popup mode: log once that we are not sending resize to server */
-  private _loggedResizeNotSent = false;
+
 
   constructor(
     info: WindowInfo,
@@ -118,7 +118,7 @@ export class WindowPopup {
     const titleBar = document.createElement('div');
     titleBar.className = 'phantom-screen-inline-titlebar';
     titleBar.innerHTML = `
-      <span class="phantom-screen-inline-title">${this.escapeHtml(info.title || info.appClass || 'Window')} [${info.windowId}]</span>
+      <span class="phantom-screen-inline-title">${this.escapeHtml(info.title || info.appClass || 'Window')}</span>
       <button class="phantom-screen-inline-close" title="Close stream">&times;</button>
     `;
     this.container.appendChild(titleBar);
@@ -142,7 +142,14 @@ export class WindowPopup {
       this.canvas?.focus();
     });
 
-    // Focus the X11 window when the canvas gets focus
+    // Focus/raise the X11 window on mousedown (not just browser focus).
+    // This ensures clicking a background window raises it immediately,
+    // even if the canvas already has browser focus.
+    this.canvas.addEventListener('mousedown', () => {
+      this.send(encodeFocusWindow(this.windowId));
+    });
+
+    // Also send focus when the canvas gets browser focus (e.g., via Tab key)
     this.canvas.addEventListener('focus', () => {
       this.send(encodeFocusWindow(this.windowId));
     });
@@ -170,24 +177,19 @@ export class WindowPopup {
     const style = doc.createElement('style');
     style.textContent = `* { margin: 0; padding: 0; box-sizing: border-box; }
       html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
-      .phantom-screen-popup-wid { position: absolute; top: 4px; left: 4px; z-index: 1; font: 11px monospace; color: rgba(255,255,255,0.8); pointer-events: none; }
       canvas { width: 100%; height: 100%; display: block; cursor: default; }`;
     doc.head.appendChild(style);
 
-    const widLabel = doc.createElement('div');
-    widLabel.className = 'phantom-screen-popup-wid';
-    widLabel.textContent = `Window ${info.windowId}`;
-    doc.body.appendChild(widLabel);
-
+    // location=no requests no URL bar; many browsers ignore it and still show
+    // about:blank. For a UI with no browser chrome, use inline mode or your own UI.
     const canvas = doc.createElement('canvas');
     canvas.id = 'stream-canvas';
     canvas.tabIndex = 0;
     doc.body.appendChild(canvas);
     this.canvas = canvas;
 
-    // Watch for popup resize. Server does not yet support dynamic resolution change,
-    // so we do not send encodeResizeWindow; the stream keeps original size and the
-    // canvas (CSS width/height 100%) stretches to fill the popup.
+    // Watch for popup resize and tell the server to resize the X11 window
+    // so the per-window pipeline captures at the new dimensions.
     this.resizeObserver = new ResizeObserver(() => {
       if (this.resizeTimeout !== null) {
         clearTimeout(this.resizeTimeout);
@@ -197,12 +199,14 @@ export class WindowPopup {
           const w = this.popup.innerWidth;
           const h = this.popup.innerHeight;
           if (w > 0 && h > 0) {
-            if (!this._loggedResizeNotSent) {
-              this._loggedResizeNotSent = true;
-              console.log(
-                `[coherence] wid=${this.windowId} popup resize (${w}x${h}): not sending to server (dynamic resolution not supported); stream will stretch to fit`,
-              );
-            }
+            const evenW = w % 2 === 0 ? w : w + 1;
+            const evenH = h % 2 === 0 ? h : h + 1;
+            console.log(
+              `[coherence] wid=${this.windowId} popup resize: raw=${w}x${h}, sending=${evenW}x${evenH} to server`,
+            );
+            this.send(encodeResizeWindow(this.windowId, evenW, evenH));
+            // Mark that we're waiting for the pipeline restart's keyframe
+            this.waitingForKeyframe = true;
           }
         }
       }, 250);
@@ -218,8 +222,13 @@ export class WindowPopup {
       this.onClose?.();
     });
 
-    // Focus the X11 window when the popup gets focus
+    // Focus/raise the X11 window when the popup or canvas is interacted with
     this.popup.addEventListener('focus', () => {
+      this.send(encodeFocusWindow(this.windowId));
+    });
+
+    // On mousedown: raise/focus the X11 window AND focus the canvas for keyboard
+    canvas.addEventListener('mousedown', () => {
       this.send(encodeFocusWindow(this.windowId));
     });
 
@@ -342,7 +351,12 @@ export class WindowPopup {
       return;
     }
 
-    if (!this.decoder) return;
+    if (!this.decoder) {
+      if (this.frameCount === 0) {
+        console.warn(`[coherence] wid=${this.windowId} frame received but no decoder`);
+      }
+      return;
+    }
 
     // Auto-recover from closed decoder
     if (this.decoder.state === 'closed') {
@@ -353,9 +367,15 @@ export class WindowPopup {
 
     // Keyframe gating: drop delta frames until we receive a keyframe
     if (this.waitingForKeyframe) {
-      if (!isKeyframe) return;
+      if (!isKeyframe) {
+        if (this.frameCount % 60 === 0) {
+          console.debug(`[coherence] wid=${this.windowId} waiting for keyframe, dropped ${this.frameCount} delta frames`);
+        }
+        this.frameCount++;
+        return;
+      }
       this.waitingForKeyframe = false;
-      console.log(`[coherence] wid=${this.windowId} received keyframe (${data.length}B), starting decode`);
+      console.log(`[coherence] wid=${this.windowId} received keyframe (${data.length}B) after ${this.frameCount} dropped deltas, starting decode`);
     }
 
     this.frameCount++;
@@ -496,11 +516,15 @@ function getPopupDecoderScript(): string {
       return;
     }
     if (d.type === 'phantom-coherence-frame') {
-      if (!decoder || decoder.state === 'closed') return;
+      if (!decoder || decoder.state === 'closed') {
+        console.debug('[popup] frame received but decoder not ready, state=' + (decoder ? decoder.state : 'null'));
+        return;
+      }
       if (waitingForKeyframe && !d.isKeyframe) return;
       if (d.isKeyframe) {
         waitingForKeyframe = false;
         if (firstPts === null) firstPts = d.pts;
+        console.log('[popup] keyframe received: ' + new Uint8Array(d.data).length + 'B');
       }
       if (!d.data) return;
       if (decoder.decodeQueueSize > 8) return;

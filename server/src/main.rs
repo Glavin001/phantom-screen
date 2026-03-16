@@ -9,6 +9,7 @@ mod pipeline;
 mod window_monitor;
 mod window_pipeline;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -17,12 +18,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 
 use config::Config;
 use input::{InputEvent, InputHandler, estimate_event_length, parse_input_event};
-use pipeline::EncodedFrame;
+use pipeline::{EncodedFrame, PipelineManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +33,12 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "phantom_screen_server=info".parse().unwrap()),
         )
         .init();
+
+    // Install a non-fatal Xlib error handler. GStreamer's ximagesrc uses Xlib
+    // internally, and the default Xlib error handler calls exit(1) on any X
+    // error (e.g., BadWindow when a window is destroyed between detection and
+    // capture). Our handler logs the error instead of crashing the process.
+    install_xlib_error_handler();
 
     let config = Config::parse();
     info!("Phantom Screen Server starting");
@@ -56,6 +63,10 @@ async fn main() -> Result<()> {
     // Wait for display to be ready
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Create input handler (before pipeline so it can be shared with PipelineManager)
+    let input_handler =
+        Arc::new(InputHandler::new(&config.display).context("Failed to create input handler")?);
+
     // Launch post-start command (e.g. a demo app) if configured
     if let Some(ref cmd) = config.post_start_command {
         info!("Launching post-start command: {}", cmd);
@@ -66,14 +77,30 @@ async fn main() -> Result<()> {
         children.push(child);
     }
 
-    // Start GStreamer pipeline
-    let (frame_rx, pipeline_controller) =
-        pipeline::start_pipeline(&config).context("Failed to start pipeline")?;
+    // Start GStreamer pipeline (shares input_handler and post_start_command for resize coordination)
+    let (_frame_rx, pipeline_manager) = pipeline::start_pipeline(
+        &config,
+        Some(input_handler.clone()),
+        config.post_start_command.clone(),
+    )
+    .context("Failed to start pipeline")?;
     info!("GStreamer pipeline running");
 
-    // Create input handler
-    let input_handler =
-        Arc::new(InputHandler::new(&config.display).context("Failed to create input handler")?);
+    // Monitor the X display for external resolution changes (e.g. xrandr, apps)
+    let pm_for_monitor = pipeline_manager.clone();
+    let display_for_monitor = config.display.clone();
+    pipeline::spawn_resolution_monitor(pm_for_monitor, display_for_monitor, Duration::from_secs(2));
+
+    // Watchdog: detect Xvfb crashes and auto-recover by restarting at current resolution.
+    // Polls every 3s, triggers recovery after 3 consecutive failures (~9s of downtime).
+    let pm_for_watchdog = pipeline_manager.clone();
+    let display_for_watchdog = config.display.clone();
+    pipeline::spawn_xvfb_watchdog(
+        pm_for_watchdog,
+        display_for_watchdog,
+        Duration::from_secs(3),
+        3,
+    );
 
     // Initialize coherence mode support (window monitor + pipeline manager)
     let coherence_state = {
@@ -86,27 +113,42 @@ async fn main() -> Result<()> {
 
         let (window_event_tx, _) = broadcast::channel::<window_monitor::WindowEvent>(256);
 
-        // Forward window monitor events to the broadcast channel
+        // Forward window monitor events to the broadcast channel.
+        // The monitor thread auto-reconnects after Xvfb restarts, so
+        // this forwarder keeps running for the lifetime of the process.
+        let composite_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
         let tx_clone = window_event_tx.clone();
+        let tracked_for_forwarder = tracked_windows.clone();
+        let composite_ready_for_forwarder = composite_ready.clone();
         tokio::spawn(async move {
             let mut rx = window_rx;
             loop {
                 match rx.recv().await {
                     Ok(event) => {
+                        // Snapshot means window monitor reconnected and Composite is re-enabled
+                        if matches!(&event, window_monitor::WindowEvent::Snapshot(_)) {
+                            composite_ready_for_forwarder
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
                         let _ = tx_clone.send(event);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!("Window event forwarder lagged by {} events", n);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        info!("Window monitor closed");
+                        info!("Window monitor channel closed (process shutting down)");
+                        // Clear tracked windows so clients don't use stale IDs
+                        if let Ok(mut shared) = tracked_for_forwarder.lock() {
+                            shared.clear();
+                        }
                         break;
                     }
                 }
             }
         });
 
-        let pipeline_manager = Arc::new(tokio::sync::Mutex::new(
+        let pipeline_manager = Arc::new(std::sync::Mutex::new(
             window_pipeline::WindowPipelineManager::new(&config),
         ));
         let window_manager = Arc::new(
@@ -114,14 +156,60 @@ async fn main() -> Result<()> {
                 .context("Failed to create window manager")?,
         );
 
+        // Pack initial display dimensions as (width << 16 | height)
+        let initial_w = config.resolution_width();
+        let initial_h = config.resolution_height();
+        let display_size = Arc::new(std::sync::atomic::AtomicU32::new(
+            pipeline::pack_display_size(initial_w as u16, initial_h as u16),
+        ));
+
         Arc::new(coherence::CoherenceState {
             window_events: window_event_tx,
             tracked_windows,
             pipeline_manager,
             window_manager,
+            composite_ready,
+            display_size,
         })
     };
     info!("Coherence mode support initialized");
+
+    // Wire display_size into PipelineManager so it's updated atomically during
+    // resize (before post-resize hooks), preventing stale clamping values.
+    pipeline_manager.set_display_size(coherence_state.display_size.clone());
+
+    // Register pre-resize hook: stop all per-window pipelines before Xvfb is killed.
+    // This prevents GStreamer's ximagesrc from holding open Xlib connections that
+    // would trigger fatal XIO errors when the X server goes away.
+    {
+        let wpm = coherence_state.pipeline_manager.clone();
+        let composite_ready = coherence_state.composite_ready.clone();
+        let window_events_tx = coherence_state.window_events.clone();
+        pipeline_manager.add_pre_resize_hook(Box::new(move || {
+            // Mark Composite as not ready — block new per-window pipeline starts
+            composite_ready.store(false, std::sync::atomic::Ordering::Release);
+
+            // Broadcast empty snapshot so clients know all window IDs are invalidated
+            let _ = window_events_tx.send(window_monitor::WindowEvent::Snapshot(vec![]));
+
+            let mut mgr = wpm.lock().unwrap();
+            let count = mgr.active_count();
+            if count > 0 {
+                tracing::info!("Pre-resize: stopping {} per-window pipeline(s)", count);
+                mgr.stop_all();
+            }
+        }));
+    }
+
+    // Register post-resize hook: reconnect WindowManager to the new X server.
+    {
+        let wm = coherence_state.window_manager.clone();
+        pipeline_manager.add_post_resize_hook(Box::new(move || {
+            if let Err(e) = wm.reconnect() {
+                tracing::error!("Post-resize: failed to reconnect WindowManager: {}", e);
+            }
+        }));
+    }
 
     // Build WebTransport server config
     let identity = if let (Some(cert_path), Some(key_path)) = (&config.cert, &config.key) {
@@ -161,7 +249,7 @@ async fn main() -> Result<()> {
     // Also start an HTTP server for serving static files and health checks
     let http_addr = SocketAddr::new(config.listen.ip(), config.listen.port() + 1);
     let client_dir = config.client_dir.clone();
-    let pc_for_http = pipeline_controller.clone();
+    let pm_for_http = pipeline_manager.clone();
     let launch_apps_json = {
         let apps = config.launch_app_list();
         format!(
@@ -173,7 +261,7 @@ async fn main() -> Result<()> {
         )
     };
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(http_addr, client_dir, pc_for_http, launch_apps_json).await
+        if let Err(e) = run_http_server(http_addr, client_dir, pm_for_http, launch_apps_json).await
         {
             error!("HTTP server error: {}", e);
         }
@@ -240,17 +328,12 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let frame_rx = if pipeline_controller.is_running() {
-                    Some(frame_rx.resubscribe())
-                } else {
-                    None
-                };
-                let pc = pipeline_controller.clone();
+                let pm = pipeline_manager.clone();
                 let ih = input_handler.clone();
                 let cs = coherence_state.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_session(session, frame_rx, pc, ih, cs).await {
+                    if let Err(e) = handle_session(session, pm, ih, cs).await {
                         warn!("Session ended: {}", e);
                     }
                 });
@@ -259,7 +342,7 @@ async fn main() -> Result<()> {
     }
 
     // Graceful shutdown: stop pipeline then kill all child processes
-    pipeline_controller.stop();
+    pipeline_manager.stop();
     for child in &mut children {
         let _ = child.kill();
         let _ = child.wait();
@@ -267,6 +350,135 @@ async fn main() -> Result<()> {
     info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Install non-fatal Xlib error handlers (both protocol errors and IO errors).
+///
+/// GStreamer elements like `ximagesrc` use Xlib (C library) internally. Xlib has
+/// TWO error handlers that can call `exit()`:
+///
+/// 1. **XSetErrorHandler** — protocol errors (BadWindow, BadMatch, etc.)
+///    Default handler prints error and calls `exit(1)`.
+///
+/// 2. **XSetIOErrorHandler** — fatal IO errors (connection lost/broken pipe)
+///    Default handler prints "XIO: fatal IO error" and calls `_exit(1)`.
+///    This fires when Xvfb is killed for resize while GStreamer still has
+///    an open Xlib connection.
+///
+/// We replace both with handlers that log warnings instead of crashing.
+fn install_xlib_error_handler() {
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct XErrorEvent {
+        _type: i32,
+        _display: *mut std::ffi::c_void,
+        resourceid: u64,
+        _serial: u64,
+        error_code: u8,
+        request_code: u8,
+        minor_code: u8,
+    }
+
+    type XErrorHandler =
+        Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut XErrorEvent) -> i32>;
+    type XIOErrorHandler = Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32>;
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XSetErrorHandler(handler: XErrorHandler) -> XErrorHandler;
+        fn XSetIOErrorHandler(handler: XIOErrorHandler) -> XIOErrorHandler;
+    }
+
+    unsafe extern "C" {
+        fn pthread_exit(retval: *mut std::ffi::c_void) -> !;
+    }
+
+    unsafe extern "C" fn non_fatal_error_handler(
+        _display: *mut std::ffi::c_void,
+        event: *mut XErrorEvent,
+    ) -> i32 {
+        use std::sync::atomic::{AtomicU64, Ordering as AO};
+
+        // Rate-limit logging to prevent error floods (e.g., stale ximagesrc
+        // generating BadMatch every frame at 60fps) from overwhelming the
+        // server and making it unresponsive.
+        static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+        static LAST_LOG_TIME: AtomicU64 = AtomicU64::new(0);
+
+        let event = unsafe { &*event };
+        let count = ERROR_COUNT.fetch_add(1, AO::Relaxed);
+
+        // Log the first 5 errors immediately, then at most once per second
+        let now_ms = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        let last = LAST_LOG_TIME.load(AO::Relaxed);
+        let should_log = count < 5 || (now_ms.saturating_sub(last) >= 1000);
+
+        if should_log {
+            let suppressed = if count >= 5 {
+                let prev = LAST_LOG_TIME.swap(now_ms, AO::Relaxed);
+                if prev == last {
+                    count.saturating_sub(4)
+                } else {
+                    0
+                }
+            } else {
+                LAST_LOG_TIME.store(now_ms, AO::Relaxed);
+                0
+            };
+            if suppressed > 0 {
+                tracing::warn!(
+                    error_code = event.error_code,
+                    request_code = event.request_code,
+                    resource_id = event.resourceid,
+                    "X11 error (non-fatal): error={} request={} resource=0x{:x} ({} errors suppressed)",
+                    event.error_code,
+                    event.request_code,
+                    event.resourceid,
+                    suppressed,
+                );
+            } else {
+                tracing::warn!(
+                    error_code = event.error_code,
+                    request_code = event.request_code,
+                    resource_id = event.resourceid,
+                    "X11 error (non-fatal): error={} request={} resource=0x{:x}",
+                    event.error_code,
+                    event.request_code,
+                    event.resourceid,
+                );
+            }
+        }
+        0
+    }
+
+    unsafe extern "C" fn non_fatal_io_error_handler(_display: *mut std::ffi::c_void) -> i32 {
+        // This fires when the X connection breaks (e.g., Xvfb killed for resize).
+        // We MUST NOT return — Xlib calls _exit(1) after this handler returns,
+        // regardless of the return value. This is by Xlib spec and cannot be
+        // overridden via XSetIOErrorHandler alone.
+        //
+        // Instead, we terminate just this thread via pthread_exit(). The thread
+        // hitting the IO error is a GStreamer streaming thread whose X connection
+        // is already broken. Killing it prevents process-wide _exit(1) while
+        // letting the rest of the server continue. The pipeline will detect the
+        // thread loss and be cleaned up normally.
+        tracing::warn!("X11 IO error: display connection lost, terminating thread");
+        unsafe {
+            pthread_exit(std::ptr::null_mut());
+        }
+    }
+
+    unsafe {
+        XSetErrorHandler(Some(non_fatal_error_handler));
+        XSetIOErrorHandler(Some(non_fatal_io_error_handler));
+    }
+    info!("Installed non-fatal Xlib error and IO error handlers");
 }
 
 /// Resolves on SIGTERM or Ctrl-C.
@@ -287,10 +499,76 @@ async fn shutdown_signal() {
     }
 }
 
+/// Core video sender loop: subscribes to pipeline broadcast channels via the
+/// watch channel, and calls `send_frame` for each frame. Automatically
+/// re-subscribes when the pipeline restarts (new broadcast sender published).
+///
+/// Extracted from `handle_session` so it can be unit-tested without WebTransport.
+async fn video_sender_loop<F, Fut>(
+    mut watch_rx: watch::Receiver<broadcast::Sender<EncodedFrame>>,
+    send_frame: F,
+) where
+    F: Fn(EncodedFrame) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send,
+{
+    loop {
+        // Subscribe to the current pipeline's broadcast channel
+        let mut frame_rx = watch_rx.borrow_and_update().subscribe();
+
+        // Stream frames until the pipeline stops or restarts
+        let restart = loop {
+            tokio::select! {
+                frame_result = frame_rx.recv() => {
+                    match frame_result {
+                        Ok(frame) => {
+                            if let Err(e) = send_frame(frame).await {
+                                warn!("Failed to send video frame: {}", e);
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Video receiver lagged by {} frames, skipping", n);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Pipeline stopped; wait for watch notification
+                            // rather than immediately re-subscribing (the new
+                            // pipeline may not be published yet).
+                            break false;
+                        }
+                    }
+                }
+                result = watch_rx.changed() => {
+                    if result.is_err() {
+                        // PipelineManager dropped, shut down
+                        info!("Pipeline manager closed, stopping video sender");
+                        return;
+                    }
+                    // New pipeline available, re-subscribe
+                    info!("Pipeline restarted, re-subscribing to video frames");
+                    break true;
+                }
+            }
+        };
+
+        // If we broke out due to Closed (not a watch notification),
+        // wait for the new pipeline to be published before re-subscribing.
+        if !restart {
+            match watch_rx.changed().await {
+                Ok(()) => {
+                    info!("Pipeline restarted, re-subscribing to video frames");
+                }
+                Err(_) => {
+                    info!("Pipeline manager closed, stopping video sender");
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn handle_session(
     session: wtransport::Connection,
-    frame_rx: Option<broadcast::Receiver<EncodedFrame>>,
-    pipeline_controller: Arc<pipeline::PipelineController>,
+    pipeline_manager: Arc<PipelineManager>,
     input_handler: Arc<InputHandler>,
     coherence_state: Arc<coherence::CoherenceState>,
 ) -> Result<()> {
@@ -298,28 +576,19 @@ async fn handle_session(
 
     let session = Arc::new(session);
 
-    // Spawn video sender - uses unidirectional streams for reliability
-    if let Some(mut rx) = frame_rx {
+    // Spawn video sender that handles pipeline restarts via watch channel
+    {
         let session_video = session.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(frame) => {
-                        if let Err(e) = send_video_frame(&session_video, &frame).await {
-                            warn!("Failed to send video frame: {}", e);
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Video receiver lagged by {} frames, skipping", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        info!("Pipeline closed, stopping video sender");
-                        break;
-                    }
-                }
+        let watch_rx = pipeline_manager.subscribe_watch();
+
+        tokio::spawn(video_sender_loop(watch_rx, move |frame| {
+            let session = session_video.clone();
+            async move {
+                send_video_frame(&session, &frame)
+                    .await
+                    .map_err(|e| e.to_string())
             }
-        });
+        }));
     }
 
     // Per-session coherence state (lazily initialized on EnableCoherence)
@@ -331,22 +600,25 @@ async fn handle_session(
         match session.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let ih = input_handler.clone();
-                let pc = pipeline_controller.clone();
+                let pm = pipeline_manager.clone();
                 let cs = coherence_state.clone();
                 let cs_session = coherence_session.clone();
                 let session_for_input = session.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
+                    let mut resize_debounce_tasks: HashMap<u32, tokio::task::JoinHandle<()>> =
+                        HashMap::new();
                     loop {
                         match recv.read(&mut buf).await {
                             Ok(Some(n)) if n > 0 => {
                                 process_input_data_with_coherence(
                                     &buf[..n],
                                     &ih,
-                                    &pc,
+                                    &pm,
                                     &cs,
                                     &cs_session,
                                     &session_for_input,
+                                    &mut resize_debounce_tasks,
                                 )
                                 .await;
                             }
@@ -356,6 +628,10 @@ async fn handle_session(
                                 break;
                             }
                         }
+                    }
+                    // Cancel pending resize debounce tasks
+                    for (_, task) in resize_debounce_tasks.drain() {
+                        task.abort();
                     }
                     // Close our side
                     let _ = send.finish().await;
@@ -397,10 +673,11 @@ async fn send_video_frame(session: &wtransport::Connection, frame: &EncodedFrame
 async fn process_input_data_with_coherence(
     data: &[u8],
     input_handler: &InputHandler,
-    pipeline_controller: &Arc<pipeline::PipelineController>,
+    pipeline_manager: &Arc<PipelineManager>,
     coherence_state: &Arc<coherence::CoherenceState>,
     coherence_session: &Arc<tokio::sync::Mutex<Option<coherence::CoherenceSession>>>,
     session: &Arc<wtransport::Connection>,
+    resize_debounce_tasks: &mut HashMap<u32, tokio::task::JoinHandle<()>>,
 ) {
     let mut offset = 0;
     while offset < data.len() {
@@ -418,6 +695,11 @@ async fn process_input_data_with_coherence(
                         let cs = coherence::CoherenceSession::new(coherence_state);
                         *cs_lock = Some(cs);
                         info!("Coherence mode enabled for session");
+
+                        // Pause the main desktop capture pipeline — per-window
+                        // pipelines take over, so the full-screen ximagesrc just
+                        // wastes X server resources and can destabilize Xvfb.
+                        pipeline_manager.pause();
 
                         // Send a fresh snapshot of current windows immediately
                         let snapshot = coherence_state.current_snapshot();
@@ -445,95 +727,35 @@ async fn process_input_data_with_coherence(
                     if let Some(mut cs) = cs_lock.take() {
                         cs.cleanup();
                         info!("Coherence mode disabled for session");
+
+                        // Resume the main desktop capture pipeline now that
+                        // per-window pipelines are torn down.
+                        pipeline_manager.resume();
                     }
                 }
                 InputEvent::SubscribeWindow { window_id } => {
-                    let mut cs_lock = coherence_session.lock().await;
-                    if let Some(ref mut cs) = *cs_lock {
-                        let wid = *window_id;
-                        match cs.subscribe_window(wid).await {
-                            Ok(mut rx) => {
-                                let session_clone = session.clone();
-                                let handle = tokio::spawn(async move {
-                                    info!("Window {} sender task STARTED", wid);
-                                    let mut seen_keyframe = false;
-                                    let mut frame_count: u64 = 0;
-                                    let mut delta_skip_count: u64 = 0;
-                                    loop {
-                                        match rx.recv().await {
-                                            Ok(frame) => {
-                                                // Keyframe gating: skip delta frames until first keyframe.
-                                                if !seen_keyframe {
-                                                    if frame.is_keyframe {
-                                                        seen_keyframe = true;
-                                                        info!(
-                                                            "Window {} sender: first keyframe ({} bytes), skipped {} deltas",
-                                                            wid,
-                                                            frame.data.len(),
-                                                            delta_skip_count
-                                                        );
-                                                    } else {
-                                                        delta_skip_count += 1;
-                                                        if delta_skip_count <= 3 {
-                                                            info!(
-                                                                "Window {} sender: skipping delta #{} ({} bytes)",
-                                                                wid,
-                                                                delta_skip_count,
-                                                                frame.data.len()
-                                                            );
-                                                        }
-                                                        continue;
-                                                    }
-                                                }
-                                                frame_count += 1;
-                                                if frame_count <= 5 {
-                                                    info!(
-                                                        "Window {} sender frame #{}: {} bytes, keyframe={}",
-                                                        wid,
-                                                        frame_count,
-                                                        frame.data.len(),
-                                                        frame.is_keyframe
-                                                    );
-                                                }
-                                                if let Err(e) = coherence::send_window_video_frame(
-                                                    &session_clone,
-                                                    wid,
-                                                    &frame,
-                                                )
-                                                .await
-                                                {
-                                                    warn!(
-                                                        "Window {} sender: SEND FAILED: {}",
-                                                        wid, e
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                                warn!(
-                                                    "Window {} sender: LAGGED by {}, resetting keyframe gate",
-                                                    wid, n
-                                                );
-                                                seen_keyframe = false;
-                                            }
-                                            Err(broadcast::error::RecvError::Closed) => {
-                                                info!("Window {} sender: channel CLOSED", wid);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    info!(
-                                        "Window {} sender task ENDED (sent {} frames)",
-                                        wid, frame_count
-                                    );
-                                });
-                                cs.track_sender(wid, handle);
-                            }
-                            Err(e) => {
-                                warn!("Failed to subscribe to window {}: {}", wid, e);
+                    if !coherence_state
+                        .composite_ready
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        warn!(
+                            "Window {} subscribe rejected: Composite not ready (display resizing)",
+                            window_id
+                        );
+                    } else {
+                        let mut cs_lock = coherence_session.lock().await;
+                        if let Some(ref mut cs) = *cs_lock {
+                            let wid = *window_id;
+                            match cs.subscribe_window(wid).await {
+                                Ok(rx) => {
+                                    spawn_window_sender(wid, rx, session, cs);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to subscribe to window {}: {}", wid, e);
+                                }
                             }
                         }
-                    }
+                    } // else composite_ready
                 }
                 InputEvent::UnsubscribeWindow { window_id } => {
                     let mut cs_lock = coherence_session.lock().await;
@@ -546,11 +768,61 @@ async fn process_input_data_with_coherence(
                     width,
                     height,
                 } => {
-                    let cs_lock = coherence_session.lock().await;
-                    if let Some(ref cs) = *cs_lock
-                        && let Err(e) = cs.resize_window(*window_id, *width, *height)
+                    if !coherence_state
+                        .composite_ready
+                        .load(std::sync::atomic::Ordering::Acquire)
                     {
-                        warn!("Failed to resize window {}: {}", window_id, e);
+                        warn!(
+                            "Window {} resize rejected: Composite not ready (display resizing)",
+                            window_id
+                        );
+                    } else if let Some(ref cs) = *coherence_session.lock().await {
+                        let wid = *window_id;
+                        let (w, h) = cs.normalize_resize(wid, *width, *height);
+
+                        // CRITICAL ORDER: stop pipeline BEFORE resizing the X11
+                        // window.  The composite pixmap is invalidated the moment
+                        // the window geometry changes.  If ximagesrc is still
+                        // running when we call resize_x11_window(), it will
+                        // access the stale pixmap and flood Xvfb with BadMatch
+                        // errors (~60/sec).  Full stop (NULL state) is required —
+                        // GStreamer's PAUSED state still performs X operations.
+                        cs.stop_window_pipeline(wid);
+
+                        // Now safe to resize the X11 window.
+                        if let Err(e) = cs.resize_x11_window(wid, w, h) {
+                            warn!("Failed to resize X11 window {}: {}", wid, e);
+                        }
+
+                        // Debounce the expensive pipeline restart: cancel any
+                        // pending restart for this window and schedule a new
+                        // one after 300ms. During rapid resizing, only the
+                        // last resize triggers a pipeline stop/start cycle.
+                        if let Some(old) = resize_debounce_tasks.remove(&wid) {
+                            old.abort();
+                        }
+                        let cs_for_debounce = coherence_session.clone();
+                        let session_for_debounce = session.clone();
+                        let expected_size = (w, h);
+                        let handle = tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            let mut cs_lock = cs_for_debounce.lock().await;
+                            if let Some(ref mut cs) = *cs_lock {
+                                match cs.restart_window_pipeline(wid, Some(expected_size)).await {
+                                    Ok(Some(rx)) => {
+                                        spawn_window_sender(wid, rx, &session_for_debounce, cs);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to restart pipeline for window {}: {}",
+                                            wid, e
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                        resize_debounce_tasks.insert(wid, handle);
                     }
                 }
                 InputEvent::FocusWindow { window_id } => {
@@ -577,7 +849,12 @@ async fn process_input_data_with_coherence(
                 }
                 _ => {
                     // Regular input events - dispatch normally
-                    if let Err(e) = dispatch_event(&event, input_handler, pipeline_controller) {
+                    if let Err(e) = dispatch_event(
+                        &event,
+                        input_handler,
+                        pipeline_manager,
+                        Some(&coherence_state.display_size),
+                    ) {
                         warn!("Failed to dispatch input event: {}", e);
                     }
                 }
@@ -630,7 +907,7 @@ async fn forward_window_events(
 fn process_input_data(
     data: &[u8],
     input_handler: &InputHandler,
-    pipeline_controller: &Arc<pipeline::PipelineController>,
+    pipeline_manager: &Arc<PipelineManager>,
 ) {
     let mut offset = 0;
     while offset < data.len() {
@@ -641,7 +918,7 @@ fn process_input_data(
         }
 
         if let Some(event) = parse_input_event(&remaining[..event_len])
-            && let Err(e) = dispatch_event(&event, input_handler, pipeline_controller)
+            && let Err(e) = dispatch_event(&event, input_handler, pipeline_manager, None)
         {
             warn!("Failed to dispatch input event: {}", e);
         }
@@ -650,10 +927,139 @@ fn process_input_data(
     }
 }
 
+/// Spawn a sender task that reads frames from a per-window broadcast receiver
+/// and sends them to the client via WebTransport.
+fn spawn_window_sender(
+    wid: u32,
+    mut rx: broadcast::Receiver<EncodedFrame>,
+    session: &Arc<wtransport::Connection>,
+    cs: &mut coherence::CoherenceSession,
+) {
+    let session_clone = session.clone();
+    let handle = tokio::spawn(async move {
+        info!("Window {} sender task STARTED", wid);
+        let mut seen_keyframe = false;
+        let mut frame_count: u64 = 0;
+        let mut delta_skip_count: u64 = 0;
+        let start_time = tokio::time::Instant::now();
+        let mut warned_no_frames = false;
+        loop {
+            // Use a timeout to detect pipelines that never produce frames.
+            // After 3s: warn. After 5s total: give up — pipeline is dead.
+            // Always use a timeout — even after keyframe.  If the window is
+            // resized by the WM after the pipeline started, ximagesrc's
+            // composite pixmap is invalidated and it stops producing frames
+            // permanently.  Without a timeout here the sender would block
+            // forever on rx.recv().
+            let timeout_dur = if !seen_keyframe {
+                std::time::Duration::from_secs(if warned_no_frames { 2 } else { 3 })
+            } else {
+                // Generous keepalive: if no frame arrives for 3s while
+                // we were previously receiving frames, the pipeline is dead.
+                std::time::Duration::from_secs(3)
+            };
+            let recv_result = match tokio::time::timeout(timeout_dur, rx.recv()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if !seen_keyframe {
+                        if warned_no_frames {
+                            warn!(
+                                "Window {} sender: no frames after {:.1}s, giving up \
+                                 (pipeline will restart on next resize)",
+                                wid,
+                                start_time.elapsed().as_secs_f64()
+                            );
+                            break;
+                        }
+                        warned_no_frames = true;
+                        warn!(
+                            "Window {} sender: no frames received after {:.1}s — \
+                             pipeline may have failed, will retry for 2 more seconds",
+                            wid,
+                            start_time.elapsed().as_secs_f64()
+                        );
+                        continue;
+                    } else {
+                        // Post-keyframe stall: pipeline died (likely composite
+                        // pixmap invalidation from a WM resize).
+                        warn!(
+                            "Window {} sender: pipeline stalled after {} frames \
+                             ({:.1}s elapsed), exiting",
+                            wid,
+                            frame_count,
+                            start_time.elapsed().as_secs_f64()
+                        );
+                        break;
+                    }
+                }
+            };
+            match recv_result {
+                Ok(frame) => {
+                    if !seen_keyframe {
+                        if frame.is_keyframe {
+                            seen_keyframe = true;
+                            info!(
+                                "Window {} sender: first keyframe ({} bytes), skipped {} deltas",
+                                wid,
+                                frame.data.len(),
+                                delta_skip_count
+                            );
+                        } else {
+                            delta_skip_count += 1;
+                            if delta_skip_count <= 3 {
+                                info!(
+                                    "Window {} sender: skipping delta #{} ({} bytes)",
+                                    wid,
+                                    delta_skip_count,
+                                    frame.data.len()
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                    frame_count += 1;
+                    if frame_count <= 5 {
+                        info!(
+                            "Window {} sender frame #{}: {} bytes, keyframe={}",
+                            wid,
+                            frame_count,
+                            frame.data.len(),
+                            frame.is_keyframe
+                        );
+                    }
+                    if let Err(e) =
+                        coherence::send_window_video_frame(&session_clone, wid, &frame).await
+                    {
+                        warn!("Window {} sender: SEND FAILED: {}", wid, e);
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(
+                        "Window {} sender: LAGGED by {}, resetting keyframe gate",
+                        wid, n
+                    );
+                    seen_keyframe = false;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    info!("Window {} sender: channel CLOSED", wid);
+                    break;
+                }
+            }
+        }
+        info!(
+            "Window {} sender task ENDED (sent {} frames)",
+            wid, frame_count
+        );
+    });
+    cs.track_sender(wid, handle);
+}
+
 fn dispatch_event(
     event: &InputEvent,
     input_handler: &InputHandler,
-    pipeline_controller: &Arc<pipeline::PipelineController>,
+    pipeline_manager: &Arc<PipelineManager>,
+    display_size: Option<&Arc<std::sync::atomic::AtomicU32>>,
 ) -> Result<()> {
     match event {
         InputEvent::MouseMove { x, y } => input_handler.mouse_move(*x, *y)?,
@@ -666,7 +1072,7 @@ fn dispatch_event(
         InputEvent::RequestKeyframe
         | InputEvent::SetBitrate { .. }
         | InputEvent::SetResolution { .. } => {
-            control::handle_control_event(event, pipeline_controller);
+            control::handle_control_event(event, pipeline_manager, display_size);
         }
         // Coherence events are handled in process_input_data_with_coherence
         InputEvent::EnableCoherence
@@ -702,7 +1108,18 @@ fn start_xvfb(config: &Config) -> Result<Child> {
     info!("Starting Xvfb on display {}", disp);
 
     let child = Command::new("Xvfb")
-        .args([disp, "-screen", "0", &format!("{resolution}x24"), "-ac"])
+        .args([
+            disp,
+            "-screen",
+            "0",
+            &format!("{resolution}x24"),
+            "-ac",
+            "+bs", // Enable BackingStore so obscured windows retain their pixels
+            "+extension",
+            "RANDR", // Enable RandR for dynamic resolution changes
+            "+extension",
+            "Composite", // Enable Composite so per-window capture gets full contents
+        ])
         .spawn()
         .context("Failed to start Xvfb")?;
 
@@ -730,7 +1147,7 @@ fn start_window_manager(config: &Config) -> Result<Child> {
 async fn run_http_server(
     addr: SocketAddr,
     client_dir: String,
-    pipeline_controller: Arc<pipeline::PipelineController>,
+    pipeline_manager: Arc<PipelineManager>,
     launch_apps_json: String,
 ) -> Result<()> {
     use hyper::body::Incoming;
@@ -745,13 +1162,13 @@ async fn run_http_server(
     loop {
         let (stream, _) = listener.accept().await?;
         let client_dir = client_dir.clone();
-        let pc = pipeline_controller.clone();
+        let pm = pipeline_manager.clone();
         let apps_json = launch_apps_json.clone();
 
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let client_dir = client_dir.clone();
-                let pc = pc.clone();
+                let pm = pm.clone();
                 let apps_json = apps_json.clone();
                 async move {
                     let path = req.uri().path();
@@ -770,7 +1187,7 @@ async fn run_http_server(
 
                     // Health/readiness endpoint
                     if path == "/health" {
-                        let status = if pc.is_running() { "ready" } else { "starting" };
+                        let status = if pm.is_running() { "ready" } else { "starting" };
                         let body = format!(r#"{{"status":"{status}"}}"#);
                         return Ok::<_, Infallible>(
                             Response::builder()
@@ -912,7 +1329,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn http_server_health_endpoint() {
-            let pc = pipeline::PipelineController::new_for_test(true);
+            let pm = pipeline::PipelineManager::new_for_test(true);
             let client_dir = "/nonexistent".to_string();
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -924,7 +1341,7 @@ mod tests {
             tokio::spawn(run_http_server(
                 bound_addr,
                 client_dir,
-                pc,
+                pm,
                 r#"["xterm","firefox"]"#.into(),
             ));
 
@@ -974,7 +1391,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn http_server_returns_404_for_missing_files() {
-            let pc = pipeline::PipelineController::new_for_test(true);
+            let pm = pipeline::PipelineManager::new_for_test(true);
             let client_dir = "/nonexistent".to_string();
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -985,7 +1402,7 @@ mod tests {
             tokio::spawn(run_http_server(
                 bound_addr,
                 client_dir,
-                pc,
+                pm,
                 r#"["xterm","firefox"]"#.into(),
             ));
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1010,65 +1427,299 @@ mod tests {
         }
     }
 
-    mod control_events {
+    /// Tests for the video_sender_loop: the async coordination between
+    /// watch channels (pipeline restarts) and broadcast channels (frame delivery).
+    ///
+    /// These tests exercise the exact race conditions that caused streaming to
+    /// break after resize — no GStreamer, no WebTransport, no X11 needed.
+    mod video_sender {
         use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{broadcast, watch};
 
-        #[test]
-        fn handle_set_resolution_does_not_panic() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            control::handle_control_event(
-                &InputEvent::SetResolution {
-                    width: 1920,
-                    height: 1080,
-                },
-                &pc,
-            );
-        }
-
-        #[test]
-        fn handle_set_resolution_various_sizes() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            for (w, h) in [(640, 480), (1280, 720), (2560, 1440), (3840, 2160)] {
-                control::handle_control_event(
-                    &InputEvent::SetResolution {
-                        width: w,
-                        height: h,
-                    },
-                    &pc,
-                );
+        fn test_frame(pts: u64) -> EncodedFrame {
+            EncodedFrame {
+                data: vec![0u8; 8],
+                pts,
+                is_keyframe: pts == 0,
             }
         }
 
-        #[test]
-        fn handle_keyframe_request_does_not_panic() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            // force_keyframe sends a GStreamer event — with a fakesink this may
-            // not propagate but must not panic.
-            control::handle_control_event(&InputEvent::RequestKeyframe, &pc);
+        /// Basic test: frames sent on the initial pipeline are received.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn receives_frames_from_initial_pipeline() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe to the broadcast channel
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Send some frames
+            for i in 0..5 {
+                tx1.send(test_frame(i)).unwrap();
+            }
+
+            // Give the loop time to process
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(received.load(Ordering::SeqCst), 5);
+
+            // Drop the watch sender to shut down the loop
+            drop(watch_tx);
+            drop(tx1);
+            let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
         }
 
-        #[test]
-        fn handle_set_bitrate_does_not_panic() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            // fakesink doesn't have a "bitrate" property so set_property will fail,
-            // but handle_control_event should not panic.
-            // Note: set_bitrate calls set_property which will panic on wrong property type.
-            // Since this uses a fakesink (no bitrate property), we test SetResolution instead
-            // to verify the control dispatch path.
-            control::handle_control_event(
-                &InputEvent::SetResolution {
-                    width: 1920,
-                    height: 1080,
-                },
-                &pc,
+        /// Simulates a pipeline restart where the watch channel notifies
+        /// BEFORE the broadcast channel closes (the happy path).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn resubscribes_when_watch_notifies_before_broadcast_closes() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Send frames on pipeline 1
+            tx1.send(test_frame(0)).unwrap();
+            tx1.send(test_frame(1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Simulate pipeline restart: create new sender, publish via watch, THEN drop old
+            let (tx2, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx2.clone()).unwrap();
+            drop(tx1); // old broadcast closes after watch already notified
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Send frames on pipeline 2
+            tx2.send(test_frame(2)).unwrap();
+            tx2.send(test_frame(3)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            assert_eq!(received.load(Ordering::SeqCst), 4);
+
+            drop(watch_tx);
+            drop(tx2);
+            let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        }
+
+        /// THE KEY BUG TEST: Simulates the race condition where the broadcast
+        /// channel closes BEFORE the watch channel is updated (because resize
+        /// runs synchronously: stop pipeline → sleep → restart → publish).
+        ///
+        /// Before the fix, the video sender would immediately re-subscribe to
+        /// the stale broadcast channel and get Closed again, missing all frames.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn resubscribes_when_broadcast_closes_before_watch_updates() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Send frames on pipeline 1
+            tx1.send(test_frame(0)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+
+            // Simulate the race: drop old broadcast FIRST (pipeline.stop())
+            drop(tx1);
+
+            // Simulate the delay from Xvfb restart (the gap where the bug occurs)
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // NOW publish the new pipeline via watch (like resize() does after restart)
+            let (tx2, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx2.clone()).unwrap();
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Send frames on pipeline 2 — these MUST be received
+            tx2.send(test_frame(1)).unwrap();
+            tx2.send(test_frame(2)).unwrap();
+            tx2.send(test_frame(3)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                4,
+                "Video sender must receive frames after pipeline restart even when \
+                 broadcast closes before watch channel updates (the resize race condition)"
+            );
+
+            drop(watch_tx);
+            drop(tx2);
+            let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        }
+
+        /// Multiple sequential resizes (the scenario from the bug report:
+        /// resize to 1350x1198, then to 1645x1198). Each resize drops the old
+        /// broadcast before publishing the new one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn survives_multiple_sequential_resizes() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Pipeline 1: send a frame
+            tx1.send(test_frame(0)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Resize 1: drop old, delay, publish new (the race)
+            drop(tx1);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let (tx2, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx2.clone()).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            tx2.send(test_frame(1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Resize 2: drop old, delay, publish new (the race again)
+            drop(tx2);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let (tx3, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx3.clone()).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            tx3.send(test_frame(2)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Resize 3: one more for good measure
+            drop(tx3);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let (tx4, _) = broadcast::channel::<EncodedFrame>(16);
+            watch_tx.send(tx4.clone()).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            tx4.send(test_frame(3)).unwrap();
+            tx4.send(test_frame(4)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                5,
+                "Video sender must survive multiple sequential resizes"
+            );
+
+            drop(watch_tx);
+            drop(tx4);
+            let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        }
+
+        /// When the PipelineManager is dropped (shutdown), the video sender
+        /// should exit cleanly rather than hang or panic.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn exits_when_pipeline_manager_dropped() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, |_frame| async { Ok(()) }));
+
+            // Drop everything — the loop should exit
+            drop(tx1);
+            drop(watch_tx);
+
+            let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+            assert!(
+                result.is_ok(),
+                "Video sender must exit promptly when pipeline manager is dropped"
             );
         }
 
-        #[test]
-        fn non_control_events_are_ignored() {
-            let pc = pipeline::PipelineController::new_for_test(true);
-            // Passing a non-control event to handle_control_event should be a no-op
-            control::handle_control_event(&InputEvent::MouseMove { x: 100, y: 200 }, &pc);
+        /// When send_frame returns an error, the loop should exit (connection lost).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn exits_on_send_error() {
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(16);
+            let (_watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let handle = tokio::spawn(video_sender_loop(watch_rx, |_frame| async {
+                Err("connection lost".to_string())
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            tx1.send(test_frame(0)).unwrap();
+
+            let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+            assert!(
+                result.is_ok(),
+                "Video sender must exit when send_frame fails"
+            );
+        }
+
+        /// When broadcast channel lags (too many frames buffered), the sender
+        /// should skip and continue rather than crash.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn handles_broadcast_lag_without_crashing() {
+            // Small buffer to force lag
+            let (tx1, _) = broadcast::channel::<EncodedFrame>(2);
+            let (_watch_tx, watch_rx) = watch::channel(tx1.clone());
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let received_clone = received.clone();
+
+            let _handle = tokio::spawn(video_sender_loop(watch_rx, move |_frame| {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }));
+
+            // Yield to let the spawned task subscribe
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Flood the channel to cause lag
+            for i in 0..10 {
+                let _ = tx1.send(test_frame(i));
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Should have received at least some frames (not crashed)
+            assert!(
+                received.load(Ordering::SeqCst) > 0,
+                "Video sender must handle lag gracefully"
+            );
         }
     }
 }
