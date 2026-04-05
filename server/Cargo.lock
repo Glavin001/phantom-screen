@@ -1216,6 +1216,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
