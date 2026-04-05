@@ -38,19 +38,20 @@ async function waitForServer(url: string, timeoutMs = 30_000): Promise<void> {
   throw new Error(`Server at ${url} not ready after ${timeoutMs}ms`);
 }
 
-/** Get the cert hash from the server's /health endpoint. */
+/** Get the cert hash from the server's /health endpoint (certSha256) or logs. */
 async function getCertHash(): Promise<string> {
-  // The health endpoint returns JSON with a certHash field,
-  // or we can scrape it from the server logs.
-  // Easier: just fetch the index page and extract from the default form value.
-  const res = await fetch(BASE_URL);
-  const html = await res.text();
+  try {
+    const healthRes = await fetch(`${BASE_URL}/health`);
+    if (healthRes.ok) {
+      const j = (await healthRes.json()) as { certSha256?: string };
+      if (j.certSha256 && /^[a-f0-9]{64}$/i.test(j.certSha256)) {
+        return j.certSha256.toLowerCase();
+      }
+    }
+  } catch {
+    /* fall through */
+  }
 
-  // The template pre-fills the cert hash input; look for it in the HTML
-  const match = html.match(/certHash=([a-f0-9]{64})/i);
-  if (match) return match[1];
-
-  // Fallback: check docker logs
   const logs = execSync(`docker logs ${CONTAINER_NAME} 2>&1`, {
     encoding: 'utf-8',
   });
