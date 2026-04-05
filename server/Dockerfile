@@ -60,6 +60,10 @@ COPY --from=builder /build/target/release/phantom-screen-server /usr/local/bin/p
 # Copy standalone client app
 COPY --from=client-builder /build/dist/standalone /var/www/phantom-screen/
 
+# Default demo desktop: xterm + Firefox so the stream is not an empty black framebuffer
+COPY server/docker-desktop-apps.sh /usr/local/bin/docker-desktop-apps.sh
+RUN chmod +x /usr/local/bin/docker-desktop-apps.sh
+
 EXPOSE 4443/udp
 EXPOSE 4443/tcp
 EXPOSE 4444/tcp
@@ -68,4 +72,4 @@ ENV DISPLAY=:99
 ENV RUST_LOG=phantom_screen_server=info
 
 ENTRYPOINT ["phantom-screen-server"]
-CMD ["--display=:99", "--resolution=1920x1080", "--client-dir=/var/www/phantom-screen"]
+CMD ["--display=:99", "--resolution=1920x1080", "--client-dir=/var/www/phantom-screen", "--post-start-command=/usr/local/bin/docker-desktop-apps.sh"]
