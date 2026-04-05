@@ -178,6 +178,9 @@ export class PhantomScreenClient {
         onWindowListChanged: (windows) => {
           this.updateCoherenceUI(windows);
         },
+        onStreamError: (message) => {
+          this.setCoherenceErrorBanner(message);
+        },
       }, this.options.decoderHardwareAcceleration ?? 'prefer-software');
 
       // Set inline parent for coherence window streams
@@ -221,6 +224,7 @@ export class PhantomScreenClient {
   /** Disable coherence mode — return to full-desktop streaming */
   disableCoherenceMode(): void {
     this.coherenceController?.disableCoherenceMode();
+    this.setCoherenceErrorBanner('');
     this.ui.canvas.style.display = '';
     const panel = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="coherence-panel"]');
     if (panel) panel.style.display = 'none';
@@ -537,6 +541,18 @@ export class PhantomScreenClient {
     } catch {
       // Non-critical — launch apps just won't be populated
     }
+  }
+
+  private setCoherenceErrorBanner(message: string): void {
+    const el = this.ui.coherenceError;
+    if (!el) return;
+    if (!message.trim()) {
+      el.style.display = 'none';
+      el.textContent = '';
+      return;
+    }
+    el.style.display = 'block';
+    el.textContent = message;
   }
 
   private updateCoherenceUI(windows: WindowInfo[]): void {

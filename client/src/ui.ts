@@ -19,6 +19,7 @@ export interface UIElements {
   pointerLockBtn: HTMLButtonElement;
   keyframeBtn: HTMLButtonElement;
   coherenceBtn: HTMLButtonElement;
+  coherenceError: HTMLElement;
   statusBar: HTMLElement;
   toolbar: HTMLElement;
 }
@@ -49,6 +50,7 @@ export function getUIElements(root: ParentNode): UIElements {
     pointerLockBtn: query<HTMLButtonElement>(root, 'pointer-lock-btn'),
     keyframeBtn: query<HTMLButtonElement>(root, 'keyframe-btn'),
     coherenceBtn: query<HTMLButtonElement>(root, 'coherence-btn'),
+    coherenceError: query<HTMLElement>(root, 'coherence-error'),
     statusBar: query<HTMLElement>(root, 'status-bar'),
     toolbar: query<HTMLElement>(root, 'toolbar'),
   };

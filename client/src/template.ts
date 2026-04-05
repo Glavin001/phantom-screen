@@ -246,6 +246,20 @@ const styles = `
     font-weight: 400;
   }
 
+  .phantom-screen-coherence-error {
+    display: none;
+    margin: 0 0 16px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    background: rgba(180, 40, 40, 0.25);
+    border: 1px solid rgba(244, 67, 54, 0.45);
+    color: #ffcdd2;
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
   .phantom-screen-coherence-section {
     margin-bottom: 20px;
   }
@@ -456,6 +470,7 @@ export function renderTemplate(root: ShadowRoot | HTMLElement, options: Template
 
       <div class="phantom-screen-coherence-panel" data-phantom-screen="coherence-panel">
         <h2>Coherence Mode</h2>
+        <div class="phantom-screen-coherence-error" data-phantom-screen="coherence-error" role="alert"></div>
         <div class="phantom-screen-coherence-section">
           <h3>Quick Launch</h3>
           <div class="phantom-screen-launch-grid" data-phantom-screen="launch-grid"></div>
