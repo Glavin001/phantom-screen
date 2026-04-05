@@ -138,6 +138,18 @@ async function openPhantomScreen(page: Page): Promise<string> {
  * Helper: wait until the canvas has non-black pixels (real video frames).
  * Samples pixels from the canvas via JavaScript and checks for non-zero values.
  */
+/** Click an element inside the client's shadow root (mount uses Shadow DOM). */
+async function clickInPhantomShadow(page: Page, selector: string): Promise<void> {
+  await page.evaluate((sel) => {
+    const app = document.getElementById('app');
+    const root = app?.shadowRoot;
+    if (!root) throw new Error('Phantom Screen shadow root not found');
+    const el = root.querySelector(sel) as HTMLElement | null;
+    if (!el) throw new Error(`Element not found in shadow: ${sel}`);
+    el.click();
+  }, selector);
+}
+
 async function waitForNonBlackCanvas(
   page: Page,
   timeoutMs = 20_000,
@@ -190,6 +202,39 @@ async function waitForNonBlackCanvas(
     await page.waitForTimeout(500);
   }
 
+  throw new Error(`Canvas still black after ${timeoutMs}ms`);
+}
+
+/** Sample canvas in a page; returns non-black pixel count in a coarse grid. */
+async function countNonBlackInCanvas(
+  page: Page,
+  timeoutMs = 25_000,
+): Promise<{ nonBlackPixels: number; totalPixels: number }> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const result = await page.evaluate(() => {
+      const canvas = document.querySelector('canvas');
+      if (!canvas) return { error: 'no-canvas', nonBlackPixels: 0, totalPixels: 0 };
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return { error: 'no-context', nonBlackPixels: 0, totalPixels: 0 };
+      const w = canvas.width;
+      const h = canvas.height;
+      if (w < 16 || h < 16) return { error: 'small-canvas', nonBlackPixels: 0, totalPixels: 0 };
+      const imageData = ctx.getImageData(0, 0, w, h);
+      const data = imageData.data;
+      let nonBlack = 0;
+      const step = 4 * 12;
+      for (let i = 0; i < data.length; i += step) {
+        if (data[i]! > 8 || data[i + 1]! > 8 || data[i + 2]! > 8) nonBlack++;
+      }
+      const totalSampled = Math.floor(data.length / step);
+      return { nonBlackPixels: nonBlack, totalPixels: totalSampled };
+    });
+    if (result.nonBlackPixels > 30) {
+      return result;
+    }
+    await page.waitForTimeout(400);
+  }
   throw new Error(`Canvas still black after ${timeoutMs}ms`);
 }
 
@@ -309,6 +354,46 @@ test('server survives resize then coherence mode', async ({ page }) => {
   expect(nonBlackPixels).toBeGreaterThan(0);
 
   console.log('Resize + coherence mode — server survived');
+});
+
+test('coherence pop-out shows video (non-black canvas)', async ({ page }) => {
+  await openPhantomScreen(page);
+  await page.waitForTimeout(3000);
+
+  await waitForNonBlackCanvas(page, 30_000);
+
+  await clickInPhantomShadow(page, '[data-phantom-screen="coherence-btn"]');
+  await page.waitForTimeout(2000);
+
+  // Wait for at least one window row (X11 window list may take a moment in the container)
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => {
+          const root = document.getElementById('app')?.shadowRoot;
+          if (!root) return false;
+          return Boolean(root.querySelector('.phantom-screen-window-popout-btn'));
+        }),
+      { timeout: 45_000, intervals: [500, 1000, 2000] },
+    )
+    .toBeTruthy();
+
+  const popupPromise = page.waitForEvent('popup');
+  await clickInPhantomShadow(page, '.phantom-screen-window-popout-btn');
+  const popup = await popupPromise;
+  await popup.waitForLoadState();
+
+  // Pop-out document should decode to visible pixels (not stuck on black / broken decoder)
+  const { nonBlackPixels, totalPixels } = await countNonBlackInCanvas(popup, 35_000);
+  console.log(
+    `Pop-out canvas: ${nonBlackPixels}/${totalPixels} non-black sampled pixels`,
+  );
+  expect(nonBlackPixels).toBeGreaterThan(totalPixels * 0.005);
+
+  await popup.close();
+
+  const healthRes = await fetch(`${BASE_URL}/health`);
+  expect(healthRes.ok).toBeTruthy();
 });
 
 test('multiple resizes do not crash the server', async ({ page }) => {
