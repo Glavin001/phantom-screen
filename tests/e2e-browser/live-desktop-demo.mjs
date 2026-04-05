@@ -13,12 +13,22 @@ if (!cert || !/^[a-f0-9]{64}$/i.test(cert)) {
   process.exit(1);
 }
 
-const url = `http://127.0.0.1:4444/?serverUrl=https://127.0.0.1:4443&certHash=${cert}&autoconnect=1`;
+const httpOrigin = process.env.PHANTOM_HTTP_ORIGIN ?? 'http://127.0.0.1:4444';
+const wtUrl = process.env.PHANTOM_WT_URL ?? 'https://127.0.0.1:4443';
+const url = `${httpOrigin}/?serverUrl=${encodeURIComponent(wtUrl)}&certHash=${cert}&autoconnect=1`;
+
+let quicHint = '127.0.0.1:4443';
+try {
+  const u = new URL(wtUrl);
+  if (u.port) quicHint = `${u.hostname}:${u.port}`;
+} catch {
+  /* keep default */
+}
 
 const browser = await chromium.launch({
   headless: false,
   args: [
-    '--origin-to-force-quic-on=127.0.0.1:4443',
+    `--origin-to-force-quic-on=${quicHint}`,
     '--ignore-certificate-errors',
     '--enable-quic',
     '--disable-popup-blocking',
