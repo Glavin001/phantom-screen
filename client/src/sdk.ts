@@ -186,6 +186,16 @@ export class PhantomScreenClient {
       return;
     }
 
+    // Bookmarked ?certHash=... values go stale when the server restarts (new self-signed cert).
+    // Prefer the live SHA-256 from GET /health whenever it differs from the form field.
+    const freshFromHealth = await fetchCertSha256FromHealth(serverUrl);
+    if (freshFromHealth) {
+      const currentNorm = certFromField ? normalizeCertHex(certFromField) : '';
+      if (!currentNorm || currentNorm !== freshFromHealth) {
+        this.ui.certHashInput.value = freshFromHealth;
+      }
+    }
+
     try {
       if (typeof WebTransport === 'undefined') {
         throw new Error('WebTransport is not available in this browser');
@@ -199,16 +209,15 @@ export class PhantomScreenClient {
         } catch (e) {
           lastError = e;
           const msg = toErrorMessage(e);
-          const canRetry =
-            attempt === 0 &&
-            isHandshakeFailureMessage(msg) &&
-            (!certFromField || !isFullSha256Hex(certFromField));
-          if (!canRetry) break;
+          if (attempt !== 0 || !isHandshakeFailureMessage(msg)) break;
 
           this.disconnect(false);
 
           const fromHealth = await fetchCertSha256FromHealth(serverUrl);
           if (!fromHealth) break;
+
+          const inField = normalizeCertHex(this.ui.certHashInput.value.trim());
+          if (inField === fromHealth) break;
 
           this.ui.certHashInput.value = fromHealth;
           this.updateState('connecting', 'Retrying with certificate hash from server…');
@@ -222,6 +231,10 @@ export class PhantomScreenClient {
       if (isHandshakeFailureMessage(detail) && certFromField && !isFullSha256Hex(certFromField)) {
         detail +=
           ' — Your certificate hash looks truncated or invalid; use all 64 hex characters or clear the field to auto-fetch.';
+      }
+      if (isHandshakeFailureMessage(detail) && freshFromHealth === null) {
+        detail +=
+          ' — Could not load /health to refresh the certificate hash; confirm the HTTP server is on port (WebTransport port + 1) and reachable.';
       }
       this.updateState('error', `Failed to connect: ${detail}`);
     }
