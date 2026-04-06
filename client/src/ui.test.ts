@@ -21,7 +21,7 @@ function createMockUI(): UIElements {
     errorMsg: document.createElement('div'),
     connectBtn: document.createElement('button'),
     serverUrlInput: document.createElement('input'),
-    certHashInput: document.createElement('input'),
+    certHashInput: document.createElement('textarea'),
     fullscreenBtn: document.createElement('button'),
     pointerLockBtn: document.createElement('button'),
     keyframeBtn: document.createElement('button'),

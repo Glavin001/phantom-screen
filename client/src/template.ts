@@ -168,7 +168,7 @@ const styles = `
   }
 
   .phantom-screen-connect-form {
-    width: min(440px, 100%);
+    width: min(640px, 100%);
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -194,6 +194,16 @@ const styles = `
 
   .phantom-screen-input:focus {
     border-color: rgba(100, 150, 255, 0.5);
+  }
+
+  .phantom-screen-cert-hash {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.35;
+    min-height: 4.5em;
+    resize: vertical;
+    word-break: break-all;
+    white-space: pre-wrap;
   }
 
   .phantom-screen-connect-btn {
@@ -445,14 +455,16 @@ export function renderTemplate(root: ShadowRoot | HTMLElement, options: Template
             />
           </label>
           <label class="phantom-screen-field">
-            <span>Server certificate SHA-256 hash</span>
-            <input
-              class="phantom-screen-input"
+            <span>Server certificate SHA-256 hash (64 hex characters)</span>
+            <textarea
+              class="phantom-screen-input phantom-screen-cert-hash"
               data-phantom-screen="cert-hash"
-              type="text"
-              placeholder="optional in production, required for self-signed WebTransport"
-              value="${escapeAttribute(certificateHash)}"
-            />
+              rows="3"
+              spellcheck="false"
+              autocomplete="off"
+              autocorrect="off"
+              placeholder="optional in production, required for self-signed WebTransport — auto-filled from /health when empty"
+            >${escapeAttribute(certificateHash)}</textarea>
           </label>
           <button class="phantom-screen-connect-btn" data-phantom-screen="connect-btn">Connect</button>
           <div class="phantom-screen-help">
