@@ -15,6 +15,8 @@ export default defineConfig({
         '--origin-to-force-quic-on=127.0.0.1:4443',
         '--ignore-certificate-errors',
         '--enable-quic',
+        // Coherence "Pop Out" uses window.open; avoid flaky blocked-popup behavior in CI.
+        '--disable-popup-blocking',
       ],
     },
     headless: true,

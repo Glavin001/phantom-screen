@@ -37,6 +37,7 @@ export class WindowPopup {
   private mode: 'inline' | 'popup' = 'inline';
   private onClose?: () => void;
   private onRequestKeyframe?: () => void;
+  private onStreamError?: (message: string) => void;
   private waitingForKeyframe = true;
   private decoderAcceleration: VideoDecoderConfig['hardwareAcceleration'];
   private lastKeyframeRequestTime = 0;
@@ -50,12 +51,14 @@ export class WindowPopup {
     inlineParent?: HTMLElement,
     onClose?: () => void,
     onRequestKeyframe?: () => void,
+    onStreamError?: (message: string) => void,
   ) {
     this.windowId = info.windowId;
     this.windowInfo = info;
     this.send = send;
     this.onClose = onClose;
     this.onRequestKeyframe = onRequestKeyframe;
+    this.onStreamError = onStreamError;
     this.decoderAcceleration = decoderAcceleration;
 
     if (inlineParent) {
@@ -65,7 +68,17 @@ export class WindowPopup {
     }
 
     if (!this.canvas) {
+      if (this.mode === 'popup' && !this.popup) {
+        // setupPopup already reported pop-up blocked or an equivalent error
+        console.error(`[sdk] wid=${info.windowId} NO CANVAS after setup, mode=${this.mode}`);
+        return;
+      }
+      const msg =
+        this.mode === 'popup'
+          ? 'Pop-out failed: the browser blocked the new window or the stream surface could not be created. Allow pop-ups for this site or use Open (inline) instead.'
+          : 'Window stream failed: could not create the canvas.';
       console.error(`[sdk] wid=${info.windowId} NO CANVAS after setup, mode=${this.mode}`);
+      this.onStreamError?.(msg);
       return;
     }
 
@@ -75,6 +88,9 @@ export class WindowPopup {
 
     if (!this.ctx) {
       console.error(`[coherence] wid=${info.windowId} failed to get 2d context, mode=${this.mode}`);
+      this.onStreamError?.(
+        `Window ${info.windowId}: could not create a 2D drawing surface (browser may block canvas in this context).`,
+      );
     }
 
     if (this.mode === 'inline') {
@@ -163,7 +179,9 @@ export class WindowPopup {
     this.popup = window.open('', uniqueName, features);
 
     if (!this.popup) {
+      const msg = `Pop-out blocked: allow pop-ups for this site to open "${info.title || info.appClass || 'Window'}" in a separate window, or use Open (inline).`;
       console.warn(`[coherence] Popup blocked for window ${info.windowId}, cannot open in popup mode`);
+      this.onStreamError?.(msg);
       return;
     }
 
@@ -182,6 +200,12 @@ export class WindowPopup {
 
     // location=no requests no URL bar; many browsers ignore it and still show
     // about:blank. For a UI with no browser chrome, use inline mode or your own UI.
+    const errBanner = doc.createElement('div');
+    errBanner.id = 'phantom-coherence-error-banner';
+    errBanner.style.cssText =
+      'display:none;position:absolute;left:0;right:0;bottom:0;padding:10px 12px;background:rgba(180,30,30,0.95);color:#fff;font:12px/1.4 system-ui,sans-serif;z-index:10;white-space:pre-wrap;word-break:break-word;';
+    doc.body.appendChild(errBanner);
+
     const canvas = doc.createElement('canvas');
     canvas.id = 'stream-canvas';
     canvas.tabIndex = 0;
@@ -273,6 +297,12 @@ export class WindowPopup {
         this.requestKeyframe();
         return;
       }
+      if (t === 'phantom-coherence-error') {
+        const detail = typeof e.data?.error === 'string' ? e.data.error : 'Unknown pop-out video error';
+        console.error(`[coherence] wid=${this.windowId} popup fatal: ${detail}`);
+        this.onStreamError?.(`Window ${this.windowId} (pop-out): ${detail}`);
+        return;
+      }
     };
     window.addEventListener('message', handler);
     this.cleanupPopupListener = () => window.removeEventListener('message', handler);
@@ -313,11 +343,24 @@ export class WindowPopup {
       },
     });
 
-    this.decoder.configure({
-      codec: 'avc1.42001f',
-      hardwareAcceleration: this.decoderAcceleration,
-      optimizeForLatency: true,
-    });
+    try {
+      this.decoder.configure({
+        codec: 'avc1.42001f',
+        hardwareAcceleration: this.decoderAcceleration,
+        optimizeForLatency: true,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[coherence] wid=${windowId} decoder configure failed: ${msg}`);
+      this.onStreamError?.(`Window ${windowId}: video decoder could not start (${msg}). Try another browser or Refresh.`);
+      try {
+        this.decoder.close();
+      } catch {
+        /* ignore */
+      }
+      this.decoder = null;
+      return;
+    }
 
     console.log(`[coherence] wid=${windowId} decoder configured (${this.decoderAcceleration})`);
   }
@@ -420,6 +463,7 @@ export class WindowPopup {
     // doesn't trigger onClose/onRequestKeyframe asynchronously
     this.onClose = undefined;
     this.onRequestKeyframe = undefined;
+    this.onStreamError = undefined;
     this.unloadHandled = true;
 
     if (this.resizeTimeout !== null) {
@@ -471,8 +515,70 @@ function getPopupDecoderScript(): string {
   var ctx = null;
   var codec = 'avc1.42001f';
   var firstPts = null;
+  var lastAccel = 'prefer-software';
+  var recoveryAttempts = 0;
+  var banner = null;
+  function showBanner(text) {
+    if (!banner) banner = document.getElementById('phantom-coherence-error-banner');
+    if (banner) {
+      banner.style.display = 'block';
+      banner.textContent = text;
+    }
+  }
+  function hideBanner() {
+    if (!banner) banner = document.getElementById('phantom-coherence-error-banner');
+    if (banner) {
+      banner.style.display = 'none';
+      banner.textContent = '';
+    }
+  }
   function notify(type, data) {
     if (window.opener) window.opener.postMessage(Object.assign({ type: type }, data || {}), '*');
+  }
+  function closeDecoder() {
+    try { if (decoder) decoder.close(); } catch (_) {}
+    decoder = null;
+  }
+  function buildDecoder() {
+    return new VideoDecoder({
+      output: function(frame) {
+        hideBanner();
+        if (!canvas || !ctx) { frame.close(); return; }
+        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+          canvas.width = frame.displayWidth;
+          canvas.height = frame.displayHeight;
+        }
+        ctx.drawImage(frame, 0, 0);
+        frame.close();
+      },
+      error: function(err) {
+        var msg = err && err.message ? String(err.message) : String(err);
+        console.error('[popup] decoder error:', msg);
+        closeDecoder();
+        recoveryAttempts++;
+        if (recoveryAttempts > 12) {
+          showBanner('Video decoder failed repeatedly. Close this window and use Open (inline) or reconnect.');
+          notify('phantom-coherence-error', { error: 'Video decoder failed after multiple recoveries: ' + msg });
+          return;
+        }
+        waitingForKeyframe = true;
+        notify('phantom-coherence-requestKeyframe', { error: msg });
+        setTimeout(function() { reconfigureDecoder(lastAccel); }, 0);
+      }
+    });
+  }
+  function reconfigureDecoder(accel) {
+    closeDecoder();
+    decoder = buildDecoder();
+    try {
+      decoder.configure({ codec: codec, hardwareAcceleration: accel || 'prefer-software', optimizeForLatency: true });
+    } catch (err) {
+      var em = err && err.message ? err.message : String(err);
+      console.error('[popup] decoder configure failed:', em);
+      closeDecoder();
+      showBanner('VideoDecoder is not available or H.264 is unsupported in this window: ' + em);
+      notify('phantom-coherence-error', { error: 'Decoder configure failed: ' + em });
+    }
   }
   window.addEventListener('message', function(e) {
     var d = e.data;
@@ -481,61 +587,47 @@ function getPopupDecoderScript(): string {
       canvas = document.getElementById('stream-canvas');
       if (!canvas || !(ctx = canvas.getContext('2d'))) {
         console.error('[popup] init failed: no canvas/ctx');
+        showBanner('Could not create canvas. Try inline (Open) instead of Pop Out.');
+        notify('phantom-coherence-error', { error: 'Popup canvas/2D context unavailable' });
         return;
       }
       if (d.width > 0 && d.height > 0) {
         canvas.width = d.width;
         canvas.height = d.height;
       }
-      try { if (decoder) decoder.close(); } catch (_) {}
+      lastAccel = d.decoderAcceleration || 'prefer-software';
+      recoveryAttempts = 0;
       waitingForKeyframe = true;
       firstPts = null;
-      decoder = new VideoDecoder({
-        output: function(frame) {
-          if (!canvas || !ctx) { frame.close(); return; }
-          if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-            canvas.width = frame.displayWidth;
-            canvas.height = frame.displayHeight;
-          }
-          ctx.drawImage(frame, 0, 0);
-          frame.close();
-        },
-        error: function(err) {
-          var msg = err && err.message ? String(err.message) : String(err);
-          console.error('[popup] decoder error:', msg);
-          decoder = null;
-          notify('phantom-coherence-requestKeyframe', { error: msg });
-        }
-      });
-      try {
-        decoder.configure({ codec: codec, hardwareAcceleration: d.decoderAcceleration || 'prefer-software', optimizeForLatency: true });
-      } catch (err) {
-        console.error('[popup] decoder configure failed:', err.message || err);
-        decoder = null;
-      }
+      reconfigureDecoder(lastAccel);
       return;
     }
     if (d.type === 'phantom-coherence-frame') {
       if (!decoder || decoder.state === 'closed') {
-        console.debug('[popup] frame received but decoder not ready, state=' + (decoder ? decoder.state : 'null'));
+        console.warn('[popup] frame received but decoder not ready; requesting keyframe');
+        notify('phantom-coherence-requestKeyframe', { error: 'decoder not ready' });
         return;
       }
       if (waitingForKeyframe && !d.isKeyframe) return;
       if (d.isKeyframe) {
         waitingForKeyframe = false;
         if (firstPts === null) firstPts = d.pts;
+        recoveryAttempts = 0;
         console.log('[popup] keyframe received: ' + new Uint8Array(d.data).length + 'B');
       }
       if (!d.data) return;
-      if (decoder.decodeQueueSize > 8) return;
+      if (decoder.decodeQueueSize > 16) return;
       var raw = new Uint8Array(d.data);
       var tsUs = firstPts !== null ? (d.pts - firstPts) / 1000 : 0;
       try {
         decoder.decode(new EncodedVideoChunk({ type: d.isKeyframe ? 'key' : 'delta', timestamp: tsUs, data: raw.slice(0) }));
       } catch (err) {
-        console.error('[popup] decode error:', err.message || err);
-        decoder = null;
-        notify('phantom-coherence-requestKeyframe', { error: err.message || String(err) });
+        var em = err && err.message ? err.message : String(err);
+        console.error('[popup] decode error:', em);
+        closeDecoder();
+        waitingForKeyframe = true;
+        notify('phantom-coherence-requestKeyframe', { error: em });
+        setTimeout(function() { reconfigureDecoder(lastAccel); }, 0);
       }
     }
   });

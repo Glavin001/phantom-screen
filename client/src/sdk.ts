@@ -35,6 +35,46 @@ function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Strip separators from a pasted cert hash for length checks */
+function normalizeCertHex(s: string): string {
+  return s.replace(/[:\s-]/g, '').toLowerCase();
+}
+
+function isFullSha256Hex(s: string): boolean {
+  return /^[0-9a-f]{64}$/.test(normalizeCertHex(s));
+}
+
+function isHandshakeFailureMessage(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return m.includes('handshake') || m.includes('opening handshake');
+}
+
+/** HTTP origin for /health (WebTransport is on port P, HTTP static server on P+1). */
+function httpOriginForWebTransportUrl(serverUrl: string): string | null {
+  try {
+    const u = new URL(serverUrl);
+    const port = u.port ? parseInt(u.port, 10) : u.protocol === 'https:' ? 443 : 80;
+    return `http://${u.hostname}:${port + 1}`;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchCertSha256FromHealth(serverUrl: string): Promise<string | null> {
+  const origin = httpOriginForWebTransportUrl(serverUrl);
+  if (!origin) return null;
+  try {
+    const res = await fetch(`${origin}/health`);
+    if (!res.ok) return null;
+    const data = (await res.json()) as { certSha256?: string };
+    const h = data.certSha256?.trim();
+    if (h && isFullSha256Hex(h)) return normalizeCertHex(h);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export class PhantomScreenClient {
   private readonly options: PhantomScreenMountOptions;
   private readonly renderRoot: ShadowRoot | HTMLElement;
@@ -136,77 +176,136 @@ export class PhantomScreenClient {
     this.updateState('connecting', 'Connecting...');
     this.ui.serverUrlInput.value = serverUrl;
 
+    const certFromField = this.ui.certHashInput.value.trim();
+    if (certFromField && !isFullSha256Hex(certFromField)) {
+      this.disconnect(false);
+      this.updateState(
+        'error',
+        'Certificate hash must be exactly 64 hex characters (SHA-256). Paste the full value from the server log or leave empty to auto-fetch from /health.',
+      );
+      return;
+    }
+
+    // Bookmarked ?certHash=... values go stale when the server restarts (new self-signed cert).
+    // Prefer the live SHA-256 from GET /health whenever it differs from the form field.
+    const freshFromHealth = await fetchCertSha256FromHealth(serverUrl);
+    if (freshFromHealth) {
+      const currentNorm = certFromField ? normalizeCertHex(certFromField) : '';
+      if (!currentNorm || currentNorm !== freshFromHealth) {
+        this.ui.certHashInput.value = freshFromHealth;
+      }
+    }
+
     try {
       if (typeof WebTransport === 'undefined') {
         throw new Error('WebTransport is not available in this browser');
       }
 
-      const transportOptions = this.resolveTransportOptions();
-      this.transport = transportOptions
-        ? new WebTransport(serverUrl, transportOptions)
-        : new WebTransport(serverUrl);
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await this.establishWebTransportSession(serverUrl);
+          return;
+        } catch (e) {
+          lastError = e;
+          const msg = toErrorMessage(e);
+          if (attempt !== 0 || !isHandshakeFailureMessage(msg)) break;
 
-      const currentTransport = this.transport;
-      currentTransport.closed
-        .then(() => {
-          if (this.transport === currentTransport) {
-            this.disconnect(false);
-            this.updateState('disconnected', 'Connection closed');
-          }
-        })
-        .catch((error) => {
-          if (this.transport === currentTransport) {
-            this.disconnect(false);
-            this.updateState('error', `Connection lost: ${toErrorMessage(error)}`);
-          }
-        });
+          this.disconnect(false);
 
-      await currentTransport.ready;
-      this.updateState('connected', 'Connected');
+          const fromHealth = await fetchCertSha256FromHealth(serverUrl);
+          if (!fromHealth) break;
 
-      const biStream = await currentTransport.createBidirectionalStream();
-      this.inputWriter = biStream.writable.getWriter();
+          const inField = normalizeCertHex(this.ui.certHashInput.value.trim());
+          if (inField === fromHealth) break;
 
-      const send: InputSender = (data: Uint8Array) => {
-        this.inputWriter?.write(data).catch(() => {
-          // Ignore writes after disconnects.
-        });
-      };
-
-      this.controlManager = new ControlManager(send, this.ui);
-      this.coherenceController = new CoherenceController(send, {
-        onWindowListChanged: (windows) => {
-          this.updateCoherenceUI(windows);
-        },
-      }, this.options.decoderHardwareAcceleration ?? 'prefer-software');
-
-      // Set inline parent for coherence window streams
-      const inlineStreams = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="inline-streams"]');
-      if (inlineStreams) {
-        this.coherenceController.setInlineParent(inlineStreams);
+          this.ui.certHashInput.value = fromHealth;
+          this.updateState('connecting', 'Retrying with certificate hash from server…');
+        }
       }
 
-      this.setupDecoder();
-
-      this.cleanupInput = attachInputListeners(
-        this.ui.canvas,
-        send,
-        () => getCanvasScale(
-          this.ui.canvas,
-          this.controlManager?.getRemoteWidth() ?? this.ui.canvas.width ?? 1920,
-          this.controlManager?.getRemoteHeight() ?? this.ui.canvas.height ?? 1080,
-        ),
-      );
-
-      this.ui.canvas.focus();
-
-      void this.readVideoStreams(currentTransport);
-      void this.readInputResponses(biStream.readable.getReader());
-      void this.loadLaunchApps(serverUrl);
+      throw lastError;
     } catch (error) {
       this.disconnect(false);
-      this.updateState('error', `Failed to connect: ${toErrorMessage(error)}`);
+      let detail = toErrorMessage(error);
+      if (isHandshakeFailureMessage(detail) && certFromField && !isFullSha256Hex(certFromField)) {
+        detail +=
+          ' — Your certificate hash looks truncated or invalid; use all 64 hex characters or clear the field to auto-fetch.';
+      }
+      if (isHandshakeFailureMessage(detail) && freshFromHealth === null) {
+        detail +=
+          ' — Could not load /health to refresh the certificate hash; confirm the HTTP server is on port (WebTransport port + 1) and reachable.';
+      }
+      this.updateState('error', `Failed to connect: ${detail}`);
     }
+  }
+
+  /** One WebTransport session: ready, bidirectional stream, decoder, video loop. */
+  private async establishWebTransportSession(serverUrl: string): Promise<void> {
+    const transportOptions = this.resolveTransportOptions();
+    this.transport = transportOptions
+      ? new WebTransport(serverUrl, transportOptions)
+      : new WebTransport(serverUrl);
+
+    const currentTransport = this.transport;
+    currentTransport.closed
+      .then(() => {
+        if (this.transport === currentTransport) {
+          this.disconnect(false);
+          this.updateState('disconnected', 'Connection closed');
+        }
+      })
+      .catch((error) => {
+        if (this.transport === currentTransport) {
+          this.disconnect(false);
+          this.updateState('error', `Connection lost: ${toErrorMessage(error)}`);
+        }
+      });
+
+    await currentTransport.ready;
+    this.updateState('connected', 'Connected');
+
+    const biStream = await currentTransport.createBidirectionalStream();
+    this.inputWriter = biStream.writable.getWriter();
+
+    const send: InputSender = (data: Uint8Array) => {
+      this.inputWriter?.write(data).catch(() => {
+        // Ignore writes after disconnects.
+      });
+    };
+
+    this.controlManager = new ControlManager(send, this.ui);
+    this.coherenceController = new CoherenceController(send, {
+      onWindowListChanged: (windows) => {
+        this.updateCoherenceUI(windows);
+      },
+      onStreamError: (message) => {
+        this.setCoherenceErrorBanner(message);
+      },
+    }, this.options.decoderHardwareAcceleration ?? 'prefer-software');
+
+    const inlineStreams = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="inline-streams"]');
+    if (inlineStreams) {
+      this.coherenceController.setInlineParent(inlineStreams);
+    }
+
+    this.setupDecoder();
+
+    this.cleanupInput = attachInputListeners(
+      this.ui.canvas,
+      send,
+      () => getCanvasScale(
+        this.ui.canvas,
+        this.controlManager?.getRemoteWidth() ?? this.ui.canvas.width ?? 1920,
+        this.controlManager?.getRemoteHeight() ?? this.ui.canvas.height ?? 1080,
+      ),
+    );
+
+    this.ui.canvas.focus();
+
+    void this.readVideoStreams(currentTransport);
+    void this.readInputResponses(biStream.readable.getReader());
+    void this.loadLaunchApps(serverUrl);
   }
 
   /** Enable coherence mode — each X11 window becomes a separate browser popup */
@@ -221,6 +320,7 @@ export class PhantomScreenClient {
   /** Disable coherence mode — return to full-desktop streaming */
   disableCoherenceMode(): void {
     this.coherenceController?.disableCoherenceMode();
+    this.setCoherenceErrorBanner('');
     this.ui.canvas.style.display = '';
     const panel = this.renderRoot.querySelector<HTMLElement>('[data-phantom-screen="coherence-panel"]');
     if (panel) panel.style.display = 'none';
@@ -537,6 +637,18 @@ export class PhantomScreenClient {
     } catch {
       // Non-critical — launch apps just won't be populated
     }
+  }
+
+  private setCoherenceErrorBanner(message: string): void {
+    const el = this.ui.coherenceError;
+    if (!el) return;
+    if (!message.trim()) {
+      el.style.display = 'none';
+      el.textContent = '';
+      return;
+    }
+    el.style.display = 'block';
+    el.textContent = message;
   }
 
   private updateCoherenceUI(windows: WindowInfo[]): void {

@@ -14,11 +14,12 @@ export interface UIElements {
   errorMsg: HTMLElement;
   connectBtn: HTMLButtonElement;
   serverUrlInput: HTMLInputElement;
-  certHashInput: HTMLInputElement;
+  certHashInput: HTMLTextAreaElement;
   fullscreenBtn: HTMLButtonElement;
   pointerLockBtn: HTMLButtonElement;
   keyframeBtn: HTMLButtonElement;
   coherenceBtn: HTMLButtonElement;
+  coherenceError: HTMLElement;
   statusBar: HTMLElement;
   toolbar: HTMLElement;
 }
@@ -44,11 +45,12 @@ export function getUIElements(root: ParentNode): UIElements {
     errorMsg: query<HTMLElement>(root, 'error-msg'),
     connectBtn: query<HTMLButtonElement>(root, 'connect-btn'),
     serverUrlInput: query<HTMLInputElement>(root, 'server-url'),
-    certHashInput: query<HTMLInputElement>(root, 'cert-hash'),
+    certHashInput: query<HTMLTextAreaElement>(root, 'cert-hash'),
     fullscreenBtn: query<HTMLButtonElement>(root, 'fullscreen-btn'),
     pointerLockBtn: query<HTMLButtonElement>(root, 'pointer-lock-btn'),
     keyframeBtn: query<HTMLButtonElement>(root, 'keyframe-btn'),
     coherenceBtn: query<HTMLButtonElement>(root, 'coherence-btn'),
+    coherenceError: query<HTMLElement>(root, 'coherence-error'),
     statusBar: query<HTMLElement>(root, 'status-bar'),
     toolbar: query<HTMLElement>(root, 'toolbar'),
   };

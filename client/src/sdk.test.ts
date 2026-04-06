@@ -32,7 +32,7 @@ describe('mountPhantomScreen', () => {
       (root.shadowRoot!.querySelector('[data-phantom-screen="server-url"]') as HTMLInputElement).value,
     ).toBe('https://demo.example:4443');
     expect(
-      (root.shadowRoot!.querySelector('[data-phantom-screen="cert-hash"]') as HTMLInputElement).value,
+      (root.shadowRoot!.querySelector('[data-phantom-screen="cert-hash"]') as HTMLTextAreaElement).value,
     ).toContain('00112233');
 
     client.destroy();

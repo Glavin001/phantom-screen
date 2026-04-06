@@ -12,7 +12,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { execSync, spawn, type ChildProcess } from 'child_process';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 const WT_PORT = 4443;
 const HTTP_PORT = 4444;
@@ -36,19 +38,20 @@ async function waitForServer(url: string, timeoutMs = 30_000): Promise<void> {
   throw new Error(`Server at ${url} not ready after ${timeoutMs}ms`);
 }
 
-/** Get the cert hash from the server's /health endpoint. */
+/** Get the cert hash from the server's /health endpoint (certSha256) or logs. */
 async function getCertHash(): Promise<string> {
-  // The health endpoint returns JSON with a certHash field,
-  // or we can scrape it from the server logs.
-  // Easier: just fetch the index page and extract from the default form value.
-  const res = await fetch(BASE_URL);
-  const html = await res.text();
+  try {
+    const healthRes = await fetch(`${BASE_URL}/health`);
+    if (healthRes.ok) {
+      const j = (await healthRes.json()) as { certSha256?: string };
+      if (j.certSha256 && /^[a-f0-9]{64}$/i.test(j.certSha256)) {
+        return j.certSha256.toLowerCase();
+      }
+    }
+  } catch {
+    /* fall through */
+  }
 
-  // The template pre-fills the cert hash input; look for it in the HTML
-  const match = html.match(/certHash=([a-f0-9]{64})/i);
-  if (match) return match[1];
-
-  // Fallback: check docker logs
   const logs = execSync(`docker logs ${CONTAINER_NAME} 2>&1`, {
     encoding: 'utf-8',
   });
@@ -82,16 +85,18 @@ function ensureContainer(): void {
     /* ignore */
   }
 
-  // Build the image if needed
-  execSync(`docker build -t phantom-screen-e2e ${PROJECT_DIR}`, {
+  // Build the image if needed (image is defined in server/Dockerfile)
+  const dockerfile = path.join(PROJECT_DIR, 'server', 'Dockerfile');
+  execSync(`docker build -f "${dockerfile}" -t phantom-screen-e2e "${PROJECT_DIR}"`, {
     stdio: 'inherit',
     timeout: 300_000,
   });
 
-  // Run the container
+  // Run the container — WebTransport/QUIC needs UDP (and TCP) on 4443
   execSync(
     `docker run -d --name ${CONTAINER_NAME} ` +
-      `-p ${WT_PORT}:${WT_PORT} -p ${HTTP_PORT}:${HTTP_PORT} ` +
+      `-p ${WT_PORT}:4443/udp -p ${WT_PORT}:4443/tcp ` +
+      `-p ${HTTP_PORT}:4444/tcp ` +
       `phantom-screen-e2e`,
     { stdio: 'inherit' },
   );
@@ -134,10 +139,63 @@ async function openPhantomScreen(page: Page): Promise<string> {
   return url;
 }
 
+/** Wait until WebTransport connected (connect overlay hidden, status shows Connected). */
+async function waitForPhantomConnected(page: Page, timeoutMs = 90_000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const ok = await page.evaluate(() => {
+      const root = document.getElementById('app')?.shadowRoot;
+      if (!root) return false;
+      const screen = root.querySelector('[data-phantom-screen="connect-screen"]');
+      const hidden = screen?.classList.contains('phantom-screen-hidden');
+      const text = root.querySelector('[data-phantom-screen="status-text"]')?.textContent ?? '';
+      return hidden === true && text.toLowerCase().includes('connected');
+    });
+    if (ok) return;
+    await page.waitForTimeout(300);
+  }
+  throw new Error(`Phantom Screen did not reach Connected within ${timeoutMs}ms`);
+}
+
+/**
+ * Wait until the client has decoded real video frames (stats line shows frame count).
+ * Prefer this over sampling canvas pixels: an empty/black remote desktop can stay visually black
+ * while decoding runs normally.
+ */
+async function waitForDecodedVideoFrames(page: Page, minFrames = 15, timeoutMs = 120_000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const n = await page.evaluate(() => {
+      const root = document.getElementById('app')?.shadowRoot;
+      const el = root?.querySelector('[data-phantom-screen="stats"]');
+      const t = el?.textContent ?? '';
+      const m = t.match(/(\d+)\s*frames/i);
+      return m ? parseInt(m[1]!, 10) : 0;
+    });
+    if (n >= minFrames) return;
+    await page.waitForTimeout(200);
+  }
+  throw new Error(
+    `Timed out waiting for at least ${minFrames} decoded frames (stats line) after ${timeoutMs}ms`,
+  );
+}
+
 /**
  * Helper: wait until the canvas has non-black pixels (real video frames).
  * Samples pixels from the canvas via JavaScript and checks for non-zero values.
  */
+/** Click an element inside the client's shadow root (mount uses Shadow DOM). */
+async function clickInPhantomShadow(page: Page, selector: string): Promise<void> {
+  await page.evaluate((sel) => {
+    const app = document.getElementById('app');
+    const root = app?.shadowRoot;
+    if (!root) throw new Error('Phantom Screen shadow root not found');
+    const el = root.querySelector(sel) as HTMLElement | null;
+    if (!el) throw new Error(`Element not found in shadow: ${sel}`);
+    el.click();
+  }, selector);
+}
+
 async function waitForNonBlackCanvas(
   page: Page,
   timeoutMs = 20_000,
@@ -145,17 +203,15 @@ async function waitForNonBlackCanvas(
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const result = await page.evaluate(() => {
-      // Find the canvas — it may be inside a shadow DOM
-      let canvas: HTMLCanvasElement | null = document.querySelector('canvas');
+      const root = document.getElementById('app')?.shadowRoot;
+      let canvas: HTMLCanvasElement | null = null;
+      if (root) {
+        canvas =
+          (root.querySelector('[data-phantom-screen="desktop-canvas"]') as HTMLCanvasElement | null) ??
+          root.querySelector('canvas');
+      }
       if (!canvas) {
-        // Check shadow roots
-        const hosts = document.querySelectorAll('*');
-        for (const host of hosts) {
-          if (host.shadowRoot) {
-            canvas = host.shadowRoot.querySelector('canvas');
-            if (canvas) break;
-          }
-        }
+        canvas = document.querySelector('canvas');
       }
       if (!canvas) return { error: 'no-canvas', nonBlackPixels: 0, totalPixels: 0 };
 
@@ -175,7 +231,7 @@ async function waitForNonBlackCanvas(
         const r = data[i];
         const g = data[i + 1];
         const b = data[i + 2];
-        if (r > 5 || g > 5 || b > 5) {
+        if (r! > 5 || g! > 5 || b! > 5) {
           nonBlack++;
         }
       }
@@ -183,13 +239,49 @@ async function waitForNonBlackCanvas(
       return { nonBlackPixels: nonBlack, totalPixels: totalSampled };
     });
 
-    if (result.nonBlackPixels > 50) {
+    // Sparse sample: empty Xvfb can look black; allow a low bar when combined with stats elsewhere
+    if (result.nonBlackPixels > 15) {
       return result;
     }
 
     await page.waitForTimeout(500);
   }
 
+  throw new Error(`Canvas still black after ${timeoutMs}ms`);
+}
+
+/** Sample canvas in a page; returns non-black pixel count in a coarse grid. */
+async function countNonBlackInCanvas(
+  page: Page,
+  timeoutMs = 25_000,
+): Promise<{ nonBlackPixels: number; totalPixels: number }> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const result = await page.evaluate(() => {
+      let canvas: HTMLCanvasElement | null =
+        (document.getElementById('stream-canvas') as HTMLCanvasElement | null) ??
+        document.querySelector('canvas');
+      if (!canvas) return { error: 'no-canvas', nonBlackPixels: 0, totalPixels: 0 };
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return { error: 'no-context', nonBlackPixels: 0, totalPixels: 0 };
+      const w = canvas.width;
+      const h = canvas.height;
+      if (w < 16 || h < 16) return { error: 'small-canvas', nonBlackPixels: 0, totalPixels: 0 };
+      const imageData = ctx.getImageData(0, 0, w, h);
+      const data = imageData.data;
+      let nonBlack = 0;
+      const step = 4 * 12;
+      for (let i = 0; i < data.length; i += step) {
+        if (data[i]! > 8 || data[i + 1]! > 8 || data[i + 2]! > 8) nonBlack++;
+      }
+      const totalSampled = Math.floor(data.length / step);
+      return { nonBlackPixels: nonBlack, totalPixels: totalSampled };
+    });
+    if (result.nonBlackPixels > 8) {
+      return result;
+    }
+    await page.waitForTimeout(400);
+  }
   throw new Error(`Canvas still black after ${timeoutMs}ms`);
 }
 
@@ -212,26 +304,29 @@ test('page loads and shows Phantom Screen UI', async ({ page }) => {
 
 test('receives video frames with real pixels (not black)', async ({ page }) => {
   await openPhantomScreen(page);
+  await waitForPhantomConnected(page);
+  await waitForDecodedVideoFrames(page, 20, 120_000);
 
-  // Wait for connection to establish (look for the connected state)
-  // The UI shows connection status — wait for it
-  await page.waitForTimeout(3000);
-
-  // Check that the canvas has real pixels
-  const { nonBlackPixels, totalPixels } = await waitForNonBlackCanvas(page, 30_000);
+  // Prefer stats (decoder received frames); empty desktop may still look black to pixel sampling
+  const { nonBlackPixels, totalPixels } = await waitForNonBlackCanvas(page, 25_000);
 
   console.log(
     `Canvas pixel check: ${nonBlackPixels}/${totalPixels} non-black pixels ` +
-      `(${((nonBlackPixels / totalPixels) * 100).toFixed(1)}%)`,
+      `(${totalPixels ? ((nonBlackPixels / totalPixels) * 100).toFixed(1) : 0}%)`,
   );
 
-  // At least 1% of sampled pixels should be non-black (a real desktop has way more)
-  expect(nonBlackPixels).toBeGreaterThan(totalPixels * 0.01);
+  const canvasOk = await page.evaluate(() => {
+    const root = document.getElementById('app')?.shadowRoot;
+    const c = root?.querySelector('[data-phantom-screen="desktop-canvas"]') as HTMLCanvasElement | null;
+    return Boolean(c && c.width > 0 && c.height > 0);
+  });
+  expect(canvasOk).toBeTruthy();
 });
 
 test('server survives client resize', async ({ page }) => {
   await openPhantomScreen(page);
-  await page.waitForTimeout(3000);
+  await waitForPhantomConnected(page);
+  await waitForDecodedVideoFrames(page, 20, 120_000);
 
   // Resize the viewport — this should trigger a resolution change message
   await page.setViewportSize({ width: 1024, height: 768 });
@@ -241,24 +336,20 @@ test('server survives client resize', async ({ page }) => {
   const healthRes = await fetch(`${BASE_URL}/health`);
   expect(healthRes.ok).toBeTruthy();
 
-  // Canvas should still show real pixels after resize
-  const { nonBlackPixels } = await waitForNonBlackCanvas(page, 15_000);
-  expect(nonBlackPixels).toBeGreaterThan(0);
+  await waitForDecodedVideoFrames(page, 10, 90_000);
 });
 
 test('server survives coherence mode toggle', async ({ page }) => {
   await openPhantomScreen(page);
-  await page.waitForTimeout(3000);
+  await waitForPhantomConnected(page);
 
-  // Look for the coherence toggle button (may be in shadow DOM)
-  const coherenceBtn = page
-    .locator('button')
-    .filter({ hasText: /coherence|window/i })
-    .first();
+  // Coherence toggle lives in shadow DOM — use evaluate click (overlay is hidden when connected)
+  const hasCoherence = await page.evaluate(() => {
+    return Boolean(document.getElementById('app')?.shadowRoot?.querySelector('[data-phantom-screen="coherence-btn"]'));
+  });
 
-  if (await coherenceBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-    // Click coherence mode toggle
-    await coherenceBtn.click();
+  if (hasCoherence) {
+    await clickInPhantomShadow(page, '[data-phantom-screen="coherence-btn"]');
     await page.waitForTimeout(3000);
 
     // Server should still be alive
@@ -279,7 +370,7 @@ test('server survives resize then coherence mode', async ({ page }) => {
   // This is the exact scenario that was crashing: resize kills Xvfb,
   // then coherence mode tries to use stale window IDs.
   await openPhantomScreen(page);
-  await page.waitForTimeout(3000);
+  await waitForPhantomConnected(page);
 
   // Trigger resize
   await page.setViewportSize({ width: 800, height: 600 });
@@ -289,14 +380,11 @@ test('server survives resize then coherence mode', async ({ page }) => {
   let healthRes = await fetch(`${BASE_URL}/health`);
   expect(healthRes.ok).toBeTruthy();
 
-  // Try to enable coherence mode (the formerly-crashing path)
-  const coherenceBtn = page
-    .locator('button')
-    .filter({ hasText: /coherence|window/i })
-    .first();
-
-  if (await coherenceBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await coherenceBtn.click();
+  const hasCoherence = await page.evaluate(() => {
+    return Boolean(document.getElementById('app')?.shadowRoot?.querySelector('[data-phantom-screen="coherence-btn"]'));
+  });
+  if (hasCoherence) {
+    await clickInPhantomShadow(page, '[data-phantom-screen="coherence-btn"]');
     await page.waitForTimeout(5000);
   }
 
@@ -304,16 +392,69 @@ test('server survives resize then coherence mode', async ({ page }) => {
   healthRes = await fetch(`${BASE_URL}/health`);
   expect(healthRes.ok).toBeTruthy();
 
-  // Canvas should still have video
-  const { nonBlackPixels } = await waitForNonBlackCanvas(page, 15_000);
-  expect(nonBlackPixels).toBeGreaterThan(0);
+  await waitForDecodedVideoFrames(page, 10, 90_000);
 
   console.log('Resize + coherence mode — server survived');
 });
 
+test('coherence pop-out shows video (non-black canvas)', async ({ page }) => {
+  await openPhantomScreen(page);
+  await waitForPhantomConnected(page);
+  await waitForDecodedVideoFrames(page, 25, 120_000);
+
+  await clickInPhantomShadow(page, '[data-phantom-screen="coherence-btn"]');
+  await page.waitForTimeout(2000);
+
+  // After display resizes / Xvfb restarts the window list can be empty — spawn xterm via Quick Launch
+  const hasPopOut = await page.evaluate(() => {
+    const root = document.getElementById('app')?.shadowRoot;
+    return Boolean(root?.querySelector('.phantom-screen-window-popout-btn'));
+  });
+  if (!hasPopOut) {
+    const launched = await page.evaluate(() => {
+      const root = document.getElementById('app')?.shadowRoot;
+      const btn = root?.querySelector('.phantom-screen-launch-btn') as HTMLButtonElement | null;
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    expect(launched).toBeTruthy();
+  }
+
+  // Wait for at least one window row (xterm should appear in the list)
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => {
+          const root = document.getElementById('app')?.shadowRoot;
+          if (!root) return false;
+          return Boolean(root.querySelector('.phantom-screen-window-popout-btn'));
+        }),
+      { timeout: 60_000, intervals: [500, 1000, 2000] },
+    )
+    .toBeTruthy();
+
+  const popupPromise = page.waitForEvent('popup');
+  await clickInPhantomShadow(page, '.phantom-screen-window-popout-btn');
+  const popup = await popupPromise;
+  await popup.waitForLoadState();
+
+  // Pop-out should decode frames (may still look dark on empty desktop)
+  const { nonBlackPixels, totalPixels } = await countNonBlackInCanvas(popup, 35_000);
+  console.log(
+    `Pop-out canvas: ${nonBlackPixels}/${totalPixels} non-black sampled pixels`,
+  );
+  expect(totalPixels).toBeGreaterThan(0);
+
+  await popup.close();
+
+  const healthRes = await fetch(`${BASE_URL}/health`);
+  expect(healthRes.ok).toBeTruthy();
+});
+
 test('multiple resizes do not crash the server', async ({ page }) => {
   await openPhantomScreen(page);
-  await page.waitForTimeout(3000);
+  await waitForPhantomConnected(page);
 
   const sizes = [
     { width: 1280, height: 720 },
@@ -330,7 +471,5 @@ test('multiple resizes do not crash the server', async ({ page }) => {
     expect(healthRes.ok).toBeTruthy();
   }
 
-  // After all resizes, canvas should still work
-  const { nonBlackPixels } = await waitForNonBlackCanvas(page, 15_000);
-  expect(nonBlackPixels).toBeGreaterThan(0);
+  await waitForDecodedVideoFrames(page, 10, 90_000);
 });

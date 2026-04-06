@@ -168,7 +168,7 @@ const styles = `
   }
 
   .phantom-screen-connect-form {
-    width: min(440px, 100%);
+    width: min(640px, 100%);
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -194,6 +194,16 @@ const styles = `
 
   .phantom-screen-input:focus {
     border-color: rgba(100, 150, 255, 0.5);
+  }
+
+  .phantom-screen-cert-hash {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.35;
+    min-height: 4.5em;
+    resize: vertical;
+    word-break: break-all;
+    white-space: pre-wrap;
   }
 
   .phantom-screen-connect-btn {
@@ -244,6 +254,20 @@ const styles = `
     margin: 0 0 12px;
     font-size: 18px;
     font-weight: 400;
+  }
+
+  .phantom-screen-coherence-error {
+    display: none;
+    margin: 0 0 16px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    background: rgba(180, 40, 40, 0.25);
+    border: 1px solid rgba(244, 67, 54, 0.45);
+    color: #ffcdd2;
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .phantom-screen-coherence-section {
@@ -431,14 +455,16 @@ export function renderTemplate(root: ShadowRoot | HTMLElement, options: Template
             />
           </label>
           <label class="phantom-screen-field">
-            <span>Server certificate SHA-256 hash</span>
-            <input
-              class="phantom-screen-input"
+            <span>Server certificate SHA-256 hash (64 hex characters)</span>
+            <textarea
+              class="phantom-screen-input phantom-screen-cert-hash"
               data-phantom-screen="cert-hash"
-              type="text"
-              placeholder="optional in production, required for self-signed WebTransport"
-              value="${escapeAttribute(certificateHash)}"
-            />
+              rows="3"
+              spellcheck="false"
+              autocomplete="off"
+              autocorrect="off"
+              placeholder="optional in production, required for self-signed WebTransport — auto-filled from /health when empty"
+            >${escapeAttribute(certificateHash)}</textarea>
           </label>
           <button class="phantom-screen-connect-btn" data-phantom-screen="connect-btn">Connect</button>
           <div class="phantom-screen-help">
@@ -456,6 +482,7 @@ export function renderTemplate(root: ShadowRoot | HTMLElement, options: Template
 
       <div class="phantom-screen-coherence-panel" data-phantom-screen="coherence-panel">
         <h2>Coherence Mode</h2>
+        <div class="phantom-screen-coherence-error" data-phantom-screen="coherence-error" role="alert"></div>
         <div class="phantom-screen-coherence-section">
           <h3>Quick Launch</h3>
           <div class="phantom-screen-launch-grid" data-phantom-screen="launch-grid"></div>

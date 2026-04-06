@@ -26,6 +26,8 @@ export interface WindowInfo {
 
 export type CoherenceEventHandler = {
   onWindowListChanged?: (windows: WindowInfo[]) => void;
+  /** User-visible error for coherence pop-out / stream failures */
+  onStreamError?: (message: string) => void;
 };
 
 export class CoherenceController {
@@ -93,6 +95,7 @@ export class CoherenceController {
 
     const mode = inline ? 'inline' : 'popup';
     console.log(`[coherence] openWindow wid=${windowId} mode=${mode}`);
+    this.handlers.onStreamError?.('');
 
     // Close existing view if already open (e.g., switching from inline to popup)
     const existing = this.popups.get(windowId);
@@ -102,7 +105,10 @@ export class CoherenceController {
       this.popups.delete(windowId);
     }
 
-    const popup = new WindowPopup(
+    // Use `let` + assignment so callbacks can close over `popup` while the constructor
+    // may invoke onStreamError synchronously (would hit TDZ with `const popup = new ...`).
+    let popup: WindowPopup;
+    popup = new WindowPopup(
       info,
       this.send,
       this.decoderAcceleration,
@@ -126,6 +132,10 @@ export class CoherenceController {
         if (this.popups.get(windowId) !== popup) return;
         console.warn(`[coherence] wid=${windowId} requesting keyframe, re-subscribing`);
         this.send(encodeSubscribeWindow(windowId));
+      },
+      (msg) => {
+        if (this.popups.get(windowId) !== popup) return;
+        if (msg) this.handlers.onStreamError?.(msg);
       },
     );
     this.popups.set(windowId, popup);
@@ -156,14 +166,17 @@ export class CoherenceController {
     if (popup) {
       popup.decodeFrame(data, isKeyframe, pts);
     } else {
-      // Only warn once per window to avoid log spam
-      if (!this._droppedFrameWarned.has(windowId)) {
-        console.warn(`[coherence] no popup for wid=${windowId}, dropping frame (further drops silent)`);
-        this._droppedFrameWarned.add(windowId);
+      const n = (this._droppedFrameCounts.get(windowId) ?? 0) + 1;
+      this._droppedFrameCounts.set(windowId, n);
+      if (n === 1 || n % 120 === 0) {
+        console.warn(
+          `[coherence] no active stream for window ${windowId}; dropping coherence frame (#${n}). ` +
+            `Open or Pop Out that window again if the list changed.`,
+        );
       }
     }
   }
-  private _droppedFrameWarned = new Set<number>();
+  private _droppedFrameCounts = new Map<number, number>();
 
   /**
    * Handle a window event message from the server (0x40 prefix).

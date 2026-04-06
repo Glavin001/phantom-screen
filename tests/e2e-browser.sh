@@ -64,12 +64,12 @@ if [ "${1:-}" != "--no-build" ]; then
   if [ -f "$SCRIPT_DIR/docker-proxy-helper.sh" ]; then
     source "$SCRIPT_DIR/docker-proxy-helper.sh"
     if [ -n "${HTTP_PROXY:-}" ]; then
-      docker_build_proxied "$PROJECT_DIR/Dockerfile" -t phantom-screen-e2e "$PROJECT_DIR"
+      docker_build_proxied "$PROJECT_DIR/server/Dockerfile" -t phantom-screen-e2e "$PROJECT_DIR"
     else
-      docker build -t phantom-screen-e2e "$PROJECT_DIR"
+      docker build -f "$PROJECT_DIR/server/Dockerfile" -t phantom-screen-e2e "$PROJECT_DIR"
     fi
   else
-    docker build -t phantom-screen-e2e "$PROJECT_DIR"
+    docker build -f "$PROJECT_DIR/server/Dockerfile" -t phantom-screen-e2e "$PROJECT_DIR"
   fi
   log_pass "Docker image built"
 fi

@@ -260,8 +260,16 @@ async fn main() -> Result<()> {
                 .join(",")
         )
     };
+    let cert_hash_for_http = cert_hash_hex.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(http_addr, client_dir, pm_for_http, launch_apps_json).await
+        if let Err(e) = run_http_server(
+            http_addr,
+            client_dir,
+            pm_for_http,
+            launch_apps_json,
+            cert_hash_for_http,
+        )
+        .await
         {
             error!("HTTP server error: {}", e);
         }
@@ -1149,13 +1157,16 @@ async fn run_http_server(
     client_dir: String,
     pipeline_manager: Arc<PipelineManager>,
     launch_apps_json: String,
+    cert_sha256_hex: String,
 ) -> Result<()> {
     use hyper::body::Incoming;
     use hyper::{Request, Response};
     use hyper_util::rt::TokioIo;
+    use serde_json::json;
     use std::convert::Infallible;
 
     let client_dir = Arc::new(PathBuf::from(client_dir));
+    let cert_sha256_hex = Arc::new(cert_sha256_hex);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -1164,12 +1175,14 @@ async fn run_http_server(
         let client_dir = client_dir.clone();
         let pm = pipeline_manager.clone();
         let apps_json = launch_apps_json.clone();
+        let cert_hex = cert_sha256_hex.clone();
 
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let client_dir = client_dir.clone();
                 let pm = pm.clone();
                 let apps_json = apps_json.clone();
+                let cert_hex = cert_hex.clone();
                 async move {
                     let path = req.uri().path();
 
@@ -1185,10 +1198,18 @@ async fn run_http_server(
                         );
                     }
 
-                    // Health/readiness endpoint
+                    // Health/readiness endpoint (includes cert hash so clients can pin TLS without parsing logs)
                     if path == "/health" {
                         let status = if pm.is_running() { "ready" } else { "starting" };
-                        let body = format!(r#"{{"status":"{status}"}}"#);
+                        let body = if cert_hex.is_empty() {
+                            json!({ "status": status }).to_string()
+                        } else {
+                            json!({
+                                "status": status,
+                                "certSha256": cert_hex.as_str(),
+                            })
+                            .to_string()
+                        };
                         return Ok::<_, Infallible>(
                             Response::builder()
                                 .status(200)
@@ -1338,11 +1359,13 @@ mod tests {
             let bound_addr = listener.local_addr().unwrap();
             drop(listener); // Release so run_http_server can bind
 
+            let test_cert = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
             tokio::spawn(run_http_server(
                 bound_addr,
                 client_dir,
                 pm,
                 r#"["xterm","firefox"]"#.into(),
+                test_cert.into(),
             ));
 
             // Give it time to bind
@@ -1386,7 +1409,12 @@ mod tests {
             use http_body_util::BodyExt;
             let body = resp.into_body().collect().await.unwrap().to_bytes();
             let body_str = String::from_utf8(body.to_vec()).unwrap();
-            assert_eq!(body_str, r#"{"status":"ready"}"#);
+            let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+            assert_eq!(v["status"], "ready");
+            assert_eq!(
+                v["certSha256"].as_str().unwrap(),
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1404,6 +1432,7 @@ mod tests {
                 client_dir,
                 pm,
                 r#"["xterm","firefox"]"#.into(),
+                String::new(),
             ));
             tokio::time::sleep(Duration::from_millis(100)).await;
 
